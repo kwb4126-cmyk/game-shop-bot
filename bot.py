@@ -30,9 +30,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-TOKEN = os.getenv("DISCORD_TOKEN")
+TOKEN = os.getenv("04af614dd76389c1306538b6cbb1a909f1d4282cdec2890c5ca0887b1a006fe7")
 # 관리자 권한이 없어도 이 역할 이름을 가진 사람은 관리자 명령어 사용 가능
-ADMIN_ROLE_NAME = os.getenv("ADMIN_ROLE_NAME", "관리자")
+ADMIN_ROLE_NAME = os.getenv("Dino bot anmin", "허용")
 DB_PATH = os.getenv("DB_PATH", "shop.db")
 KST = timezone(timedelta(hours=9))
 
