@@ -797,3 +797,31 @@ if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("❌ .env 파일에 DISCORD_TOKEN을 설정해주세요.")
     bot.run(TOKEN)
+
+from flask import Flask
+import threading
+
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "봇이 정상적으로 실행 중입니다!"
+
+def run():
+    # Render나 Koyeb은 보통 PORT 환경 변수를 자동으로 지정해 줍니다.
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
+
+def keep_alive():
+    t = threading.Thread(target=run)
+    t.start()
+
+if __name__ == "__main__":
+    if not TOKEN:
+        raise SystemExit("❌ .env 파일에 DISCORD_TOKEN을 설정해주세요.")
+    
+    # 웹 서버 스레드 시작
+    keep_alive()
+    
+    # 디스코드 봇 실행
+    bot.run(TOKEN)
