@@ -1,7 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-게임숍 디스코드 봇 - 가격표 + 거래 내역 + 채널 제한 + 티켓 시스템 통합 버전
-------------------------------------------------------------------------
+게임숍 디스코드 봇 - 가격표 + 거래 내역 + 채널 제한 + 티켓 시스템 + 사용 등록 시스템
+------------------------------------------------------------------------------
+0) 등록 (봇을 쓰기 위한 필수 절차, 접두사 명령어)
+   !서버등록          : 이 서버에서 봇 사용을 활성화 (Discord "관리자" 권한자만)
+   !관리자등록 @유저  : 봇을 쓸 수 있는 관리자 등록 (등록된 관리자만)
+   !관리자해제 @유저  : 등록된 관리자 해제 (등록된 관리자만)
+   !관리자목록        : 등록된 관리자 목록 조회 (등록된 관리자만)
+
+   ⚠️ 서버가 등록되지 않았거나, 등록된 관리자가 아니면
+      아래 모든 슬래시(/) 명령어는 사용할 수 없어요.
+
+1) 채널 제한
+   /방등록 /방해제    : 봇 명령어를 쓸 수 있는 채널 지정
+
+2) 가격표 / 거래 내역 / 티켓 시스템 (기존 기능 동일)
+
+관리자 판단 기준: 서버의 "관리자(Administrator)" 권한을 가진 사람
+또는 ADMIN_ROLE_NAME 으로 지정한 역할을 가진 사람
+또는 !관리자등록 으로 등록된 사람
 """
 
 import os
@@ -15,14 +32,47 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-TOKEN = os.getenv("04af614dd76389c1306538b6cbb1a909f1d4282cdec2890c5ca0887b1a006fe7")
-ADMIN_ROLE_NAME = os.getenv("Dino bot anmin", "허용")
+# 반드시 환경변수 "이름"만 넣어야 해요. 실제 토큰 값을 여기에 직접 쓰면 안 됩니다.
+TOKEN = os.getenv("DISCORD_TOKEN")
+ADMIN_ROLE_NAME = os.getenv("ADMIN_ROLE_NAME", "! !디노")
 DB_PATH = os.getenv("DB_PATH", "shop.db")
 KST = timezone(timedelta(hours=9))
 
 intents = discord.Intents.default()
-intents.members = True  # 유저 프로필 및 멤버 정보 조회를 위해 필요
-bot = commands.Bot(command_prefix="!", intents=intents)
+intents.members = True          # 멤버 프로필/역할 조회
+intents.message_content = True  # !서버등록, !관리자등록 같은 접두사 명령어를 읽기 위해 필요
+
+
+class GatedCommandTree(app_commands.CommandTree):
+    """모든 슬래시 명령어 실행 전에 '서버 등록' + '관리자 등록' 여부를 확인한다."""
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "이 봇은 서버 안에서만 사용할 수 있어요.", ephemeral=True
+            )
+            return False
+
+        if not is_guild_registered(interaction.guild_id):
+            await interaction.response.send_message(
+                "⚠️ 이 서버는 아직 봇 사용 등록이 안 되어 있어요.\n"
+                "서버 관리자가 `!서버등록` 명령어를 먼저 실행해주세요.",
+                ephemeral=True,
+            )
+            return False
+
+        if not is_admin(interaction):
+            await interaction.response.send_message(
+                "❌ 이 봇은 등록된 관리자만 사용할 수 있어요.\n"
+                "서버 관리자에게 `!관리자등록` 을 요청하세요.",
+                ephemeral=True,
+            )
+            return False
+
+        return True
+
+
+bot = commands.Bot(command_prefix="!", intents=intents, tree_cls=GatedCommandTree)
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +125,6 @@ def init_db():
         )
         """
     )
-    # 티켓 로그 채널 설정 테이블
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS ticket_config (
@@ -84,7 +133,6 @@ def init_db():
         )
         """
     )
-    # 활성화된 티켓 정보 저장 테이블
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS active_tickets (
@@ -96,20 +144,113 @@ def init_db():
         )
         """
     )
+    # 봇 사용을 허가한 서버 목록
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS registered_guilds (
+            guild_id INTEGER PRIMARY KEY,
+            registered_by INTEGER NOT NULL,
+            registered_at TEXT NOT NULL
+        )
+        """
+    )
+    # 서버별로 등록된 봇 관리자 목록
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bot_admins (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            added_by INTEGER NOT NULL,
+            added_at TEXT NOT NULL,
+            PRIMARY KEY (guild_id, user_id)
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
 
 # ---------------------------------------------------------------------------
+# 등록 관련 헬퍼
+# ---------------------------------------------------------------------------
+def is_guild_registered(guild_id: int) -> bool:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT 1 FROM registered_guilds WHERE guild_id = ?", (guild_id,)
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def register_guild(guild_id: int, by_id: int):
+    conn = get_conn()
+    conn.execute(
+        "INSERT OR IGNORE INTO registered_guilds (guild_id, registered_by, registered_at) VALUES (?, ?, ?)",
+        (guild_id, by_id, now_kst_str()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def is_bot_admin(guild_id: int, user_id: int) -> bool:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT 1 FROM bot_admins WHERE guild_id = ? AND user_id = ?", (guild_id, user_id)
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def add_bot_admin(guild_id: int, user_id: int, added_by: int):
+    conn = get_conn()
+    conn.execute(
+        "INSERT OR IGNORE INTO bot_admins (guild_id, user_id, added_by, added_at) VALUES (?, ?, ?, ?)",
+        (guild_id, user_id, added_by, now_kst_str()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def remove_bot_admin(guild_id: int, user_id: int) -> bool:
+    conn = get_conn()
+    cur = conn.execute(
+        "DELETE FROM bot_admins WHERE guild_id = ? AND user_id = ?", (guild_id, user_id)
+    )
+    conn.commit()
+    conn.close()
+    return cur.rowcount > 0
+
+
+def list_bot_admins(guild_id: int):
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT user_id FROM bot_admins WHERE guild_id = ?", (guild_id,)
+    ).fetchall()
+    conn.close()
+    return [r["user_id"] for r in rows]
+
+
+# ---------------------------------------------------------------------------
 # 권한 및 채널 체크 함수
 # ---------------------------------------------------------------------------
-def is_admin(interaction: discord.Interaction) -> bool:
-    member = interaction.user
+def is_admin(ctx_or_interaction) -> bool:
+    """discord.Interaction(슬래시) 과 commands.Context(접두사 !) 둘 다 지원."""
+    if isinstance(ctx_or_interaction, discord.Interaction):
+        member = ctx_or_interaction.user
+        guild_id = ctx_or_interaction.guild_id
+    else:
+        member = ctx_or_interaction.author
+        guild_id = ctx_or_interaction.guild.id if ctx_or_interaction.guild else None
+
     if not isinstance(member, discord.Member):
         return False
     if member.guild_permissions.administrator:
         return True
-    return any(role.name == ADMIN_ROLE_NAME for role in member.roles)
+    if any(role.name == ADMIN_ROLE_NAME for role in member.roles):
+        return True
+    if guild_id and is_bot_admin(guild_id, member.id):
+        return True
+    return False
 
 
 def admin_only():
@@ -128,7 +269,7 @@ def check_channel():
     async def predicate(interaction: discord.Interaction) -> bool:
         if not interaction.guild_id:
             return True
-            
+
         conn = get_conn()
         rows = conn.execute(
             "SELECT channel_id FROM allowed_channels WHERE guild_id = ?",
@@ -172,6 +313,98 @@ async def on_ready():
     except Exception as e:
         print(f"명령어 동기화 실패: {e}")
     print(f"✅ 로그인 완료: {bot.user}")
+
+
+@bot.event
+async def on_command_error(ctx: commands.Context, error: commands.CommandError):
+    if isinstance(error, commands.CommandNotFound):
+        return
+    if isinstance(error, commands.MemberNotFound):
+        await ctx.reply("⚠️ 해당 유저를 찾을 수 없어요. @멘션으로 지정해주세요.")
+        return
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.reply("⚠️ 필요한 값이 빠졌어요. 사용법을 확인해주세요.")
+        return
+    print(f"접두사 명령어 오류: {error}")
+
+
+# ---------------------------------------------------------------------------
+# 등록 명령어 (!서버등록, !관리자등록, !관리자해제, !관리자목록)
+# ---------------------------------------------------------------------------
+@bot.command(name="서버등록")
+async def register_server(ctx: commands.Context):
+    if ctx.guild is None:
+        await ctx.reply("이 명령어는 서버 안에서만 사용할 수 있어요.")
+        return
+    if not ctx.author.guild_permissions.administrator:
+        await ctx.reply("❌ 이 명령어는 Discord 서버의 '관리자(Administrator)' 권한을 가진 사람만 사용할 수 있어요.")
+        return
+    if is_guild_registered(ctx.guild.id):
+        await ctx.reply("✅ 이미 등록된 서버예요.")
+        return
+
+    register_guild(ctx.guild.id, ctx.author.id)
+    add_bot_admin(ctx.guild.id, ctx.author.id, ctx.author.id)
+    await ctx.reply(
+        "✅ 서버 등록 완료! 이제 슬래시 명령어(`/가격표` 등)를 쓸 수 있어요.\n"
+        f"({ctx.author.mention} 님은 자동으로 봇 관리자로 등록됐어요.)\n"
+        "다른 사람도 봇을 쓰게 하려면 `!관리자등록 @유저` 로 추가해주세요."
+    )
+
+
+@bot.command(name="관리자등록")
+async def register_admin(ctx: commands.Context, member: discord.Member = None):
+    if ctx.guild is None:
+        await ctx.reply("이 명령어는 서버 안에서만 사용할 수 있어요.")
+        return
+    if not is_guild_registered(ctx.guild.id):
+        await ctx.reply("⚠️ 먼저 `!서버등록` 을 실행해주세요.")
+        return
+    if not is_admin(ctx):
+        await ctx.reply("❌ 이 명령어는 등록된 관리자만 사용할 수 있어요.")
+        return
+    if member is None:
+        await ctx.reply("사용법: `!관리자등록 @유저`")
+        return
+
+    add_bot_admin(ctx.guild.id, member.id, ctx.author.id)
+    await ctx.reply(f"✅ {member.mention} 님을 봇 관리자로 등록했어요.")
+
+
+@bot.command(name="관리자해제")
+async def unregister_admin(ctx: commands.Context, member: discord.Member = None):
+    if ctx.guild is None:
+        await ctx.reply("이 명령어는 서버 안에서만 사용할 수 있어요.")
+        return
+    if not is_admin(ctx):
+        await ctx.reply("❌ 이 명령어는 등록된 관리자만 사용할 수 있어요.")
+        return
+    if member is None:
+        await ctx.reply("사용법: `!관리자해제 @유저`")
+        return
+
+    removed = remove_bot_admin(ctx.guild.id, member.id)
+    if removed:
+        await ctx.reply(f"🗑️ {member.mention} 님의 봇 관리자 권한을 해제했어요.")
+    else:
+        await ctx.reply(f"⚠️ {member.mention} 님은 등록된 봇 관리자가 아니에요.")
+
+
+@bot.command(name="관리자목록")
+async def list_admins(ctx: commands.Context):
+    if ctx.guild is None:
+        await ctx.reply("이 명령어는 서버 안에서만 사용할 수 있어요.")
+        return
+    if not is_admin(ctx):
+        await ctx.reply("❌ 이 명령어는 등록된 관리자만 사용할 수 있어요.")
+        return
+
+    ids = list_bot_admins(ctx.guild.id)
+    if not ids:
+        await ctx.reply("등록된 봇 관리자가 없어요.")
+        return
+    mentions = "\n".join(f"<@{uid}>" for uid in ids)
+    await ctx.reply(f"👑 등록된 봇 관리자:\n{mentions}")
 
 
 # ---------------------------------------------------------------------------
@@ -567,7 +800,6 @@ class TicketSelect(discord.ui.Select):
         selected_item = self.values[0]
         guild = interaction.guild
 
-        # 상품 정보 확인
         conn = get_conn()
         item_row = conn.execute(
             "SELECT * FROM prices WHERE guild_id = ? AND item = ?",
@@ -579,25 +811,21 @@ class TicketSelect(discord.ui.Select):
             await interaction.response.send_message("⚠️ 해당 상품을 찾을 수 없습니다.", ephemeral=True)
             return
 
-        # 티켓 채널 권한 설정
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(read_messages=False),
             interaction.user: discord.PermissionOverwrite(read_messages=True, send_messages=True),
             guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True)
         }
 
-        # 관리자 권한을 가진 사람들도 티켓을 볼 수 있도록 처리
         for role in guild.roles:
             if role.permissions.administrator or role.name == ADMIN_ROLE_NAME:
                 overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
 
         channel_name = f"ticket-{interaction.user.name}-{selected_item}"
-        # 특수문자 정제 (디스코드 채널 이름 규칙)
         channel_name = "".join(c for c in channel_name if c.isalnum() or c in "-_").lower()[:90]
 
         ticket_channel = await guild.create_text_channel(name=channel_name, overwrites=overwrites)
 
-        # 데이터베이스에 활성 티켓 기록 (기본 수량 1개)
         conn = get_conn()
         conn.execute(
             "INSERT INTO active_tickets (channel_id, guild_id, buyer_id, item, quantity) VALUES (?, ?, ?, ?, ?)",
@@ -606,7 +834,6 @@ class TicketSelect(discord.ui.Select):
         conn.commit()
         conn.close()
 
-        # 티켓 채널 내부 메시지 전송
         embed = discord.Embed(
             title="🎫 구매 티켓 생성 완료",
             description=f"{interaction.user.mention}님, 환영합니다!\n선택하신 상품: **{selected_item}** ({fmt_won(item_row['price'])})\n\n관리자가 내용을 확인 후 처리를 도와드립니다. 완료되면 관리자가 아래 버튼을 눌러 티켓을 마감합니다.",
@@ -652,7 +879,6 @@ class TicketControlView(discord.ui.View):
         item_name = ticket_row["item"]
         quantity = ticket_row["quantity"]
 
-        # 상품 가격 조회
         item_row = conn.execute(
             "SELECT * FROM prices WHERE guild_id = ? AND item = ?",
             (guild.id, item_name)
@@ -666,7 +892,6 @@ class TicketControlView(discord.ui.View):
         unit_price = item_row["price"]
         total_price = unit_price * quantity
 
-        # 로그 채널 확인
         config_row = conn.execute(
             "SELECT log_channel_id FROM ticket_config WHERE guild_id = ?",
             (guild.id,)
@@ -674,9 +899,8 @@ class TicketControlView(discord.ui.View):
 
         buyer_member = guild.get_member(buyer_id)
         buyer_name = str(buyer_member) if buyer_member else f"ID: {buyer_id}"
-        buyer_avatar = buyer_member.display_avatar.url if buyer_member else guild.icon.url if guild.icon else None
+        buyer_avatar = buyer_member.display_avatar.url if buyer_member else (guild.icon.url if guild.icon else None)
 
-        # 거래 내역 추가 및 재고 차감
         conn.execute(
             """
             INSERT INTO transactions
@@ -703,12 +927,10 @@ class TicketControlView(discord.ui.View):
                 (quantity, guild.id, item_name),
             )
 
-        # 활성 티켓 데이터 삭제
         conn.execute("DELETE FROM active_tickets WHERE channel_id = ?", (channel.id,))
         conn.commit()
         conn.close()
 
-        # 구매 로그 채널로 전송
         if config_row:
             log_channel = guild.get_channel(config_row["log_channel_id"])
             if log_channel:
@@ -732,8 +954,7 @@ class TicketControlView(discord.ui.View):
                 await log_channel.send(embed=log_embed)
 
         await interaction.response.send_message("🔒 티켓이 마감되었습니다. 5초 뒤 채널이 삭제됩니다.", ephemeral=False)
-        
-        # 5초 후 채널 삭제
+
         import asyncio
         await asyncio.sleep(5)
         try:
@@ -759,13 +980,8 @@ async def create_ticket_panel(interaction: discord.Interaction):
 
     options = []
     for r in rows:
-        label = f"{r['item']} ({fmt_won(r['price'])})"
-        # 디스코드 셀렉트 메뉴 값 길이 제한(100자) 및 고유 식별자 처리
-        if len(label) > 100:
-            label = label[:100]
         options.append(discord.SelectOption(label=r['item'], description=f"가격: {fmt_won(r['price'])}"))
 
-    # 최대 25개 제한 고려
     if len(options) > 25:
         options = options[:25]
 
@@ -782,12 +998,12 @@ async def create_ticket_panel(interaction: discord.Interaction):
 
 
 # ---------------------------------------------------------------------------
-# 에러 핸들링
+# 슬래시 명령어 에러 핸들링
 # ---------------------------------------------------------------------------
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.CheckFailure):
-        return  
+        return
     print(f"명령어 오류: {error}")
     if not interaction.response.is_done():
         await interaction.response.send_message("⚠️ 오류가 발생했어요. 잠시 후 다시 시도해주세요.", ephemeral=True)
@@ -795,33 +1011,5 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
 if __name__ == "__main__":
     if not TOKEN:
-        raise SystemExit("❌ .env 파일에 DISCORD_TOKEN을 설정해주세요.")
-    bot.run(TOKEN)
-
-from flask import Flask
-import threading
-
-app = Flask('')
-
-@app.route('/')
-def home():
-    return "봇이 정상적으로 실행 중입니다!"
-
-def run():
-    # Render나 Koyeb은 보통 PORT 환경 변수를 자동으로 지정해 줍니다.
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host='0.0.0.0', port=port)
-
-def keep_alive():
-    t = threading.Thread(target=run)
-    t.start()
-
-if __name__ == "__main__":
-    if not TOKEN:
-        raise SystemExit("❌ .env 파일에 DISCORD_TOKEN을 설정해주세요.")
-    
-    # 웹 서버 스레드 시작
-    keep_alive()
-    
-    # 디스코드 봇 실행
+        raise SystemExit("❌ DISCORD_TOKEN 환경변수가 설정되지 않았어요. Discloud 환경변수에 등록해주세요.")
     bot.run(TOKEN)
