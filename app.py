@@ -313,7 +313,7 @@ async def manual_charge(interaction: discord.Interaction, 유저: discord.Member
     await interaction.response.send_message(f"✅ {유저.mention}님에게 **{fmt_won(금액)}**을 수동 충전했습니다. (현재 잔액: {fmt_won(current_total)})", ephemeral=True)
 
 # ---------------------------------------------------------------------------
-# 추가 추천 기능 명령어 (포인트 조회, 구매 내역)
+# 유저 조회 명령어
 # ---------------------------------------------------------------------------
 @bot.tree.command(name="포인트조회", description="내 남은 포인트 잔액을 확인합니다.")
 async def check_my_points(interaction: discord.Interaction):
@@ -524,7 +524,6 @@ class VendingConfirmView(discord.ui.View):
 
         combined_accounts = "\n---\n".join(account_contents) if account_contents else "관리자에게 문의해주세요 (텍스트 재고 부족)"
 
-        # 실제 남은 재고 개수를 정확하게 다시 카운트하여 prices 테이블 동기화
         real_stock_count = conn.execute("SELECT COUNT(*) as cnt FROM item_stocks WHERE guild_id = ? AND item = ? AND is_used = 0", (guild_id, self.item_name)).fetchone()["cnt"]
         new_stock = -1 if item_info["stock"] == -1 else real_stock_count
         conn.execute("UPDATE prices SET stock = ? WHERE guild_id = ? AND item = ?", (new_stock, guild_id, self.item_name))
@@ -555,15 +554,20 @@ class VendingConfirmView(discord.ui.View):
 
         await interaction.response.send_message(msg, ephemeral=True)
 
+# ---------------------------------------------------------------------------
+# 자판기 메인 패널 생성 명령어 (서버 이름 동적 반영)
+# ---------------------------------------------------------------------------
 @bot.tree.command(name="자판기패널", description="[관리자/판매자] 자판기 메인 패널을 전송합니다.")
 @admin_or_seller_only()
 async def vending_panel(interaction: discord.Interaction):
+    server_name = interaction.guild.name if interaction.guild else "서버"
+    
     embed = discord.Embed(
-        title="LUMOS 자판기",
+        title=f"🛒 {server_name} 자판기",
         description="상품 구매 시 다이렉트 메시지(DM)가 허용되어 있어야 합니다.",
         color=discord.Color.blurple()
     )
-    embed.set_thumbnail(url=interaction.guild.icon.url if interaction.guild.icon else None)
+    embed.set_thumbnail(url=interaction.guild.icon.url if interaction.guild and interaction.guild.icon else None)
     view = VendingMainView()
     await interaction.channel.send(embed=embed, view=view)
     await interaction.response.send_message("✅ 자판기 패널이 생성되었습니다.", ephemeral=True)
