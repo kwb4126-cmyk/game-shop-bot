@@ -2,6 +2,8 @@
 import os
 import sqlite3
 import asyncio
+import secrets
+import string
 from datetime import datetime, timezone, timedelta
 
 import discord
@@ -32,9 +34,16 @@ class GatedCommandTree(app_commands.CommandTree):
             await interaction.response.send_message("이 봇은 서버 안에서만 사용할 수 있어요.", ephemeral=True)
             return False
 
+        # 라이센스 등록 명령어는 미등록 서버에서도 실행 허용
+        cmd_name = interaction.data.get("name") if interaction.data else None
+        if cmd_name == "라이센스등록":
+            return True
+
+        # 서버 등록 및 라이센스 유효 여부 확인
         if not is_guild_registered(interaction.guild_id):
             await interaction.response.send_message(
-                "⚠️ 이 서버는 아직 봇 사용 등록이 안 되어 있어요.\n서버 관리자가 `!서버등록` 명령어를 먼저 실행해주세요.",
+                "⚠️ 이 서버는 사용 승인이 되지 않았거나 라이센스가 만료되었습니다.\n"
+                "- 봇 개발자의 직인 승인(`!서버등록`) 또는 `/라이센스등록` 명령어를 이용해주세요.",
                 ephemeral=True,
             )
             return False
@@ -114,7 +123,23 @@ def init_db():
         CREATE TABLE IF NOT EXISTS registered_guilds (
             guild_id INTEGER PRIMARY KEY,
             registered_by INTEGER NOT NULL,
-            registered_at TEXT NOT NULL
+            registered_at TEXT NOT NULL,
+            expires_at TEXT
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS licenses (
+            license_key TEXT PRIMARY KEY,
+            duration_days INTEGER NOT NULL,
+            is_used INTEGER DEFAULT 0,
+            used_by_guild INTEGER,
+            used_at TEXT
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS guild_settings (
+            guild_id INTEGER PRIMARY KEY,
+            receipt_channel_id INTEGER
         )
     """)
     cur.execute("""
@@ -135,23 +160,46 @@ def init_db():
             PRIMARY KEY (guild_id, user_id)
         )
     """)
+
+    try:
+        cur.execute("ALTER TABLE registered_guilds ADD COLUMN expires_at TEXT")
+    except sqlite3.OperationalError:
+        pass
+
     conn.commit()
     conn.close()
 
 # ---------------------------------------------------------------------------
 # 권한 및 헬퍼 함수
 # ---------------------------------------------------------------------------
+def generate_license_key() -> str:
+    chars = string.ascii_uppercase + string.digits
+    parts = [''.join(secrets.choice(chars) for _ in range(4)) for _ in range(4)]
+    return "-".join(parts)
+
 def is_guild_registered(guild_id: int) -> bool:
     conn = get_conn()
-    row = conn.execute("SELECT 1 FROM registered_guilds WHERE guild_id = ?", (guild_id,)).fetchone()
+    row = conn.execute("SELECT expires_at FROM registered_guilds WHERE guild_id = ?", (guild_id,)).fetchone()
     conn.close()
-    return row is not None
+    if not row:
+        return False
+    
+    expires_at_str = row["expires_at"]
+    if expires_at_str is None:
+        return True
+    
+    exp_dt = datetime.strptime(expires_at_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
+    return datetime.now(KST) < exp_dt
 
-def register_guild(guild_id: int, by_id: int):
+def register_guild(guild_id: int, by_id: int, expires_at: str = None):
     conn = get_conn()
     conn.execute(
-        "INSERT OR IGNORE INTO registered_guilds (guild_id, registered_by, registered_at) VALUES (?, ?, ?)",
-        (guild_id, by_id, now_kst_str()),
+        """
+        INSERT INTO registered_guilds (guild_id, registered_by, registered_at, expires_at) 
+        VALUES (?, ?, ?, ?) 
+        ON CONFLICT(guild_id) DO UPDATE SET registered_by=?, registered_at=?, expires_at=?
+        """,
+        (guild_id, by_id, now_kst_str(), expires_at, by_id, now_kst_str(), expires_at),
     )
     conn.commit()
     conn.close()
@@ -240,21 +288,96 @@ async def on_ready():
     print(f"✅ 로그인 완료: {bot.user}")
 
 # ---------------------------------------------------------------------------
-# 서버 및 권한 관리 명령어
+# 개발자 승인 및 라이센스 관리 명령어
 # ---------------------------------------------------------------------------
 @bot.command(name="서버등록")
 async def register_server(ctx: commands.Context):
+    """[봇 소유자 전용] 개발자가 직접 서버를 영구 승인 등록합니다."""
     if ctx.guild is None:
         return
-    if not ctx.author.guild_permissions.administrator:
-        await ctx.reply("❌ 관리자만 가능합니다.")
+    
+    if not await bot.is_owner(ctx.author):
+        await ctx.reply("❌ 이 명령어는 봇 개발자만 사용할 수 있습니다.")
         return
-    if is_guild_registered(ctx.guild.id):
-        await ctx.reply("✅ 이미 등록된 서버예요.")
-        return
-    register_guild(ctx.guild.id, ctx.author.id)
-    await ctx.reply("✅ 서버 등록 완료!")
 
+    register_guild(ctx.guild.id, ctx.author.id, expires_at=None)
+    await ctx.reply(f"✅ **[{ctx.guild.name}]** 서버 등록이 완료되었습니다! (개발자 영구 승인)")
+
+@bot.tree.command(name="라이센스생성", description="[개발자] 신규 이용 라이센스 키를 발급합니다.")
+@app_commands.describe(일수="유효 기간(일 단위, 예: 30)")
+async def create_license(interaction: discord.Interaction, 일수: int):
+    if not await bot.is_owner(interaction.user):
+        await interaction.response.send_message("❌ 이 명령어는 봇 개발자만 사용할 수 있습니다.", ephemeral=True)
+        return
+
+    key = generate_license_key()
+    conn = get_conn()
+    conn.execute("INSERT INTO licenses (license_key, duration_days) VALUES (?, ?)", (key, 일수))
+    conn.commit()
+    conn.close()
+
+    await interaction.response.send_message(f"🔑 **라이센스 키 발급 완료**\n- 키: `{key}`\n- 유효기간: **{일수}일**", ephemeral=True)
+
+@bot.tree.command(name="라이센스등록", description="발급받은 라이센스 키를 통해 서버 사용 권한을 활성화합니다.")
+@app_commands.describe(라이센스키="발급받은 라이센스 키 (XXXX-XXXX-XXXX-XXXX)")
+async def redeem_license(interaction: discord.Interaction, 라이센스키: str):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ 서버 관리자만 라이센스를 등록할 수 있습니다.", ephemeral=True)
+        return
+
+    key = 라이센스키.strip()
+    conn = get_conn()
+    lic = conn.execute("SELECT * FROM licenses WHERE license_key = ?", (key,)).fetchone()
+
+    if not lic:
+        conn.close()
+        await interaction.response.send_message("❌ 존재하지 않는 라이센스 키입니다.", ephemeral=True)
+        return
+
+    if lic["is_used"]:
+        conn.close()
+        await interaction.response.send_message("❌ 이미 사용된 라이센스 키입니다.", ephemeral=True)
+        return
+
+    duration = lic["duration_days"]
+    now_dt = datetime.now(KST)
+
+    current_reg = conn.execute("SELECT expires_at FROM registered_guilds WHERE guild_id = ?", (interaction.guild_id,)).fetchone()
+    if current_reg and current_reg["expires_at"]:
+        cur_exp = datetime.strptime(current_reg["expires_at"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
+        start_dt = max(now_dt, cur_exp)
+    else:
+        start_dt = now_dt
+
+    exp_dt = start_dt + timedelta(days=duration)
+    exp_str = exp_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    conn.execute("UPDATE licenses SET is_used = 1, used_by_guild = ?, used_at = ? WHERE license_key = ?", (interaction.guild_id, now_kst_str(), key))
+    conn.execute(
+        "INSERT INTO registered_guilds (guild_id, registered_by, registered_at, expires_at) VALUES (?, ?, ?, ?) ON CONFLICT(guild_id) DO UPDATE SET expires_at = ?",
+        (interaction.guild_id, interaction.user.id, now_kst_str(), exp_str, exp_str)
+    )
+    conn.commit()
+    conn.close()
+
+    await interaction.response.send_message(f"🎉 **라이센스 등록 완료!**\n- **{duration}일** 추가되었습니다.\n- 만료일: `{exp_str}`", ephemeral=True)
+
+@bot.tree.command(name="영수증채널설정", description="[관리자/판매자] 구매 영수증이 출력될 채널을 지정합니다.")
+@app_commands.describe(채널="영수증 메시지가 전송될 텍스트 채널")
+@admin_or_seller_only()
+async def set_receipt_channel(interaction: discord.Interaction, 채널: discord.TextChannel):
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO guild_settings (guild_id, receipt_channel_id) VALUES (?, ?) ON CONFLICT(guild_id) DO UPDATE SET receipt_channel_id = ?",
+        (interaction.guild_id, 채널.id, 채널.id)
+    )
+    conn.commit()
+    conn.close()
+    await interaction.response.send_message(f"✅ 구매 영수증 채널이 {채널.mention} (으)로 설정되었습니다.", ephemeral=True)
+
+# ---------------------------------------------------------------------------
+# 관리자 및 판매자 기능 명령어
+# ---------------------------------------------------------------------------
 @bot.tree.command(name="판매자등록", description="[관리자] 특정 유저에게 패널 및 상품 관리 권한을 부여합니다.")
 @app_commands.describe(유저="판매자로 등록할 유저 멘션 (@유저)")
 async def register_seller(interaction: discord.Interaction, 유저: discord.Member):
@@ -263,7 +386,7 @@ async def register_seller(interaction: discord.Interaction, 유저: discord.Memb
         return
 
     add_bot_seller(interaction.guild_id, 유저.id, interaction.user.id)
-    await interaction.response.send_message(f"✅ {유저.mention}님을 **판매자**로 등록했습니다. 이제 자판기 패널 생성 및 상품/재고 관리가 가능합니다.", ephemeral=True)
+    await interaction.response.send_message(f"✅ {유저.mention}님을 **판매자**로 등록했습니다.", ephemeral=True)
 
 @bot.tree.command(name="가격추가", description="[관리자/판매자] 새 상품을 등록합니다.")
 @app_commands.describe(상품명="상품 이름", 가격="가격(원)", 카테고리="카테고리 이름", 재고="초기 재고")
@@ -329,7 +452,7 @@ async def check_my_points(interaction: discord.Interaction):
 async def check_my_transactions(interaction: discord.Interaction):
     conn = get_conn()
     rows = conn.execute(
-        "SELECT item, quantity, total_price, created_at FROM transactions WHERE guild_id = ? AND buyer_id = ? ORDER BY id DESC LIMIT 5",
+        "SELECT id, item, quantity, total_price, created_at FROM transactions WHERE guild_id = ? AND buyer_id = ? ORDER BY id DESC LIMIT 5",
         (interaction.guild_id, interaction.user.id)
     ).fetchall()
     conn.close()
@@ -341,7 +464,7 @@ async def check_my_transactions(interaction: discord.Interaction):
     embed = discord.Embed(title="📜 최근 구매 내역 (최근 5건)", color=discord.Color.blurple())
     for r in rows:
         embed.add_field(
-            name=f"상품: {r['item']} ({r['quantity']}개)",
+            name=f"주문 번호 #{r['id']} - {r['item']} ({r['quantity']}개)",
             value=f"• 결제 금액: `{fmt_won(r['total_price'])}`\n• 구매 일시: `{r['created_at']}`",
             inline=False
         )
@@ -515,6 +638,7 @@ class VendingConfirmView(discord.ui.View):
             await interaction.response.send_message("❌ 처리 도중 재고가 부족해졌습니다.", ephemeral=True)
             return
 
+        # 포인트 차감
         conn.execute("UPDATE user_points SET points = points - ? WHERE guild_id = ? AND user_id = ?", (self.total_price, guild_id, user_id))
 
         account_contents = []
@@ -524,17 +648,42 @@ class VendingConfirmView(discord.ui.View):
 
         combined_accounts = "\n---\n".join(account_contents) if account_contents else "관리자에게 문의해주세요 (텍스트 재고 부족)"
 
+        # 재고 동기화
         real_stock_count = conn.execute("SELECT COUNT(*) as cnt FROM item_stocks WHERE guild_id = ? AND item = ? AND is_used = 0", (guild_id, self.item_name)).fetchone()["cnt"]
         new_stock = -1 if item_info["stock"] == -1 else real_stock_count
         conn.execute("UPDATE prices SET stock = ? WHERE guild_id = ? AND item = ?", (new_stock, guild_id, self.item_name))
 
-        conn.execute(
+        # 거래 기록 저장
+        cur = conn.cursor()
+        cur.execute(
             "INSERT INTO transactions (guild_id, buyer_id, buyer_name, item, quantity, unit_price, total_price, memo, created_at, recorded_by) VALUES (?, ?, ?, ?, ?, ?, ?, '자판기 수량구매', ?, 'System')",
             (guild_id, user_id, str(interaction.user), self.item_name, self.quantity, int(self.total_price/self.quantity), self.total_price, now_kst_str())
         )
+        tx_id = cur.lastrowid
+
+        # 영수증 채널 설정값 가져오기
+        setting_row = conn.execute("SELECT receipt_channel_id FROM guild_settings WHERE guild_id = ?", (guild_id,)).fetchone()
+
         conn.commit()
         conn.close()
 
+        # 🎯 요청해주신 서식으로 구매 로그/영수증 메시지 생성
+        receipt_text = (
+            f"구매로그는 {interaction.user.mention}\n"
+            f"구매 감사드립니다\n"
+            f"💰 {fmt_won(self.total_price)}\n"
+            f"📦 {self.item_name}\n"
+            f"🔢 {self.quantity}개"
+        )
+
+        receipt_embed = discord.Embed(
+            title=f"🧾 구매로그 [주문 #{tx_id}]",
+            description=receipt_text,
+            color=discord.Color.green(),
+            timestamp=datetime.now(KST)
+        )
+
+        # 1) DM으로 상품 및 구매로그 발송
         dm_success = True
         try:
             dm_embed = discord.Embed(
@@ -543,19 +692,29 @@ class VendingConfirmView(discord.ui.View):
                 color=discord.Color.gold()
             )
             await interaction.user.send(embed=dm_embed)
+            await interaction.user.send(embed=receipt_embed)
         except Exception:
             dm_success = False
+
+        # 2) 설정된 영수증 채널로 전송
+        if setting_row and setting_row["receipt_channel_id"]:
+            receipt_channel = interaction.guild.get_channel(setting_row["receipt_channel_id"])
+            if receipt_channel:
+                try:
+                    await receipt_channel.send(embed=receipt_embed)
+                except Exception as e:
+                    print(f"영수증 채널 전송 실패: {e}")
 
         msg = f"✅ 총 **{self.quantity}개** 구매가 완료되었습니다!"
         if not dm_success:
             msg += f"\n⚠️ **DM 차단** 상태여서 발송 실패! 관리자에게 문의하세요:\n`{combined_accounts}`"
         else:
-            msg += "\n📬 개인 메시지(DM)로 계정 정보가 발송되었습니다."
+            msg += "\n📬 개인 메시지(DM)로 계정 정보와 영수증이 발송되었습니다."
 
         await interaction.response.send_message(msg, ephemeral=True)
 
 # ---------------------------------------------------------------------------
-# 자판기 메인 패널 생성 명령어 (서버 이름 동적 반영)
+# 자판기 메인 패널 생성 명령어
 # ---------------------------------------------------------------------------
 @bot.tree.command(name="자판기패널", description="[관리자/판매자] 자판기 메인 패널을 전송합니다.")
 @admin_or_seller_only()
