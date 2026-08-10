@@ -294,11 +294,18 @@ def get_user_points(guild_id: int, user_id: int) -> int:
     conn.close()
     return row["points"] if row else 0
 
-def get_user_discount_rate(guild_id: int, user_id: int) -> tuple[float, int, int]:
+# ---------------------------------------------------------------------------
+# [플래티넘 등급 체계] 세분화된 VIP Tier 계산 함수
+# ---------------------------------------------------------------------------
+def get_user_tier_info(guild_id: int, user_id: int) -> dict:
     """
-    유저의 누적 구매 횟수 및 금액을 확인하여 할인율을 반환합니다.
-    - 조건: 구매 10회 이상 OR 누적 금액 30,000원 이상 시 영구 5% 할인
-    - 반환값: (할인율, 누적 구매 횟수, 누적 결제 금액)
+    유저의 누적 구매 횟수 및 금액을 확인하여 플래티넘을 포함한 등급 정보를 반환합니다.
+    - DIAMOND  : 30만 원 이상 OR 50회 이상 (15% 할인)
+    - PLATINUM : 10만 원 이상 OR 20회 이상 (10% 할인)
+    - GOLD     : 5만 원 이상 OR 10회 이상 (8% 할인)
+    - SILVER   : 3만 원 이상 OR 5회 이상 (5% 할인)
+    - BRONZE   : 1만 원 이상 OR 3회 이상 (2% 할인)
+    - NORMAL   : 일반 회원 (0% 할인)
     """
     conn = get_conn()
     row = conn.execute(
@@ -311,21 +318,48 @@ def get_user_discount_rate(guild_id: int, user_id: int) -> tuple[float, int, int
     ).fetchone()
     conn.close()
 
-    if not row:
-        return 0.0, 0, 0
+    count = row["count"] if row else 0
+    total_spent = row["total_spent"] if row else 0
 
-    count = row["count"]
-    total_spent = row["total_spent"]
+    # (등급 아이콘, 등급명, 필요 누적금액, 필요 구매횟수, 할인율)
+    tiers = [
+        ("💎", "다이아몬드", 300000, 50, 0.15),
+        ("👑", "플래티넘", 100000, 20, 0.10),
+        ("🥇", "골드", 50000, 10, 0.08),
+        ("🥈", "실버", 30000, 5, 0.05),
+        ("🥉", "브론즈", 10000, 3, 0.02),
+    ]
 
-    if count >= 10 or total_spent >= 30000:
-        return 0.05, count, total_spent
-    
-    return 0.0, count, total_spent
+    for i, (icon, name, req_spent, req_count, rate) in enumerate(tiers):
+        if total_spent >= req_spent or count >= req_count:
+            if i > 0:
+                next_t = tiers[i - 1]
+                next_goal = f"다음 등급: {next_t[0]} **{next_t[1]}** (필요: {fmt_won(next_t[2])} 또는 {next_t[3]}회)"
+            else:
+                next_goal = "✨ **최고 등급(다이아몬드) 달성!**"
+
+            return {
+                "icon": icon,
+                "name": name,
+                "discount_rate": rate,
+                "count": count,
+                "total_spent": total_spent,
+                "next_goal": next_goal
+            }
+
+    return {
+        "icon": "🌱",
+        "name": "일반 회원",
+        "discount_rate": 0.0,
+        "count": count,
+        "total_spent": total_spent,
+        "next_goal": "다음 등급: 🥉 **브론즈** (필요: 10,000원 또는 3회 구매)"
+    }
 
 @bot.event
 async def on_ready():
     init_db()
-    # 영구 뷰 등록 (봇 재시작 후에도 버튼 정상 작동)
+    # 영구 뷰 등록
     bot.add_view(VendingMainView())
     bot.add_view(TicketPanelView())
     bot.add_view(TicketControlView())
@@ -426,7 +460,7 @@ async def set_receipt_channel(interaction: discord.Interaction, 채널: discord.
     await interaction.response.send_message(f"✅ 구매 영수증 채널이 {채널.mention} (으)로 설정되었습니다.", ephemeral=True)
 
 # ---------------------------------------------------------------------------
-# 관리자 및 판매자 기능 명령어 (자판기 / 티켓 구분 등록)
+# 관리자 및 판매자 기능 명령어
 # ---------------------------------------------------------------------------
 @bot.tree.command(name="판매자등록", description="[관리자] 특정 유저에게 패널 및 상품 관리 권한을 부여합니다.")
 @app_commands.describe(유저="판매자로 등록할 유저 멘션 (@유저)")
@@ -503,20 +537,23 @@ async def manual_charge(interaction: discord.Interaction, 유저: discord.Member
     await interaction.response.send_message(f"✅ {유저.mention}님에게 **{fmt_won(금액)}**을 수동 충전했습니다. (현재 잔액: {fmt_won(current_total)})", ephemeral=True)
 
 # ---------------------------------------------------------------------------
-# 유저 조회 명령어
+# 유저 조회 명령어 (플래티넘 등급 연동)
 # ---------------------------------------------------------------------------
-@bot.tree.command(name="포인트조회", description="내 남은 포인트 잔액을 확인합니다.")
+@bot.tree.command(name="포인트조회", description="내 남은 포인트 잔액 및 VIP 등급(플래티넘 등)을 확인합니다.")
 async def check_my_points(interaction: discord.Interaction):
     pts = get_user_points(interaction.guild_id, interaction.user.id)
-    discount_rate, count, spent = get_user_discount_rate(interaction.guild_id, interaction.user.id)
+    tier_info = get_user_tier_info(interaction.guild_id, interaction.user.id)
     
-    vip_status = "👑 **VIP 회원 (영구 5% 할인 적용 중)**" if discount_rate > 0 else f"💡 일반 회원 *(누적: {count}회 / {fmt_won(spent)} ➡️ 10회 또는 3만원 달성 시 VIP)*"
+    disc_percent = int(tier_info["discount_rate"] * 100)
+    status_str = f"{tier_info['icon']} **{tier_info['name']}** ({disc_percent}% 할인 혜택)"
 
     embed = discord.Embed(
-        title="💰 내 포인트 잔액 및 등급",
-        description=f"{interaction.user.mention}님의 현재 정보입니다.\n\n"
-                    f"• **잔액:** `{fmt_won(pts)}`\n"
-                    f"• **등급:** {vip_status}",
+        title="💰 내 포인트 잔액 및 등급 정보",
+        description=f"{interaction.user.mention}님의 현재 회원 등급입니다.\n\n"
+                    f"• **보유 포인트:** `{fmt_won(pts)}`\n"
+                    f"• **회원 등급:** {status_str}\n"
+                    f"• **누적 결제:** `{fmt_won(tier_info['total_spent'])}` ({tier_info['count']}회 구매)\n\n"
+                    f"💡 {tier_info['next_goal']}",
         color=discord.Color.gold()
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -544,7 +581,7 @@ async def check_my_transactions(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # ---------------------------------------------------------------------------
-# 구매 처리 공통 헬퍼 함수 (구매 감사 로그 & VIP 할인 적용)
+# 구매 처리 공통 헬퍼 함수
 # ---------------------------------------------------------------------------
 async def process_purchase(interaction: discord.Interaction, item_name: str, quantity: int, total_price: int, memo_text: str = "자판기 구매"):
     guild_id = interaction.guild_id
@@ -587,20 +624,19 @@ async def process_purchase(interaction: discord.Interaction, item_name: str, qua
     )
     tx_id = cur.lastrowid
 
-    # 영수증 채널 설정값 가져오기
     setting_row = conn.execute("SELECT receipt_channel_id FROM guild_settings WHERE guild_id = ?", (guild_id,)).fetchone()
 
     conn.commit()
     conn.close()
 
-    # VIP 할인 적용 여부 확인
-    discount_rate, _, _ = get_user_discount_rate(guild_id, user_id)
-    discount_text = " (VIP 5% 할인 적용)" if discount_rate > 0 else ""
+    # 유저 등급 계산
+    tier_info = get_user_tier_info(guild_id, user_id)
+    tier_text = f" ({tier_info['icon']} {tier_info['name']} {int(tier_info['discount_rate']*100)}% 할인 적용)" if tier_info['discount_rate'] > 0 else ""
 
-    # 🎯 지정된 양식의 구매 로그 / 영수증 메시지 생성
+    # 🧾 구매 로그 / 영수증 메시지
     receipt_text = (
         f"구매로그는 {interaction.user.mention}\n"
-        f"구매 감사드립니다{discount_text}\n"
+        f"구매 감사드립니다{tier_text}\n"
         f"💰 {fmt_won(total_price)}\n"
         f"📦 {item_name}\n"
         f"🔢 {quantity}개"
@@ -613,7 +649,7 @@ async def process_purchase(interaction: discord.Interaction, item_name: str, qua
         timestamp=datetime.now(KST)
     )
 
-    # 1) DM으로 계정 및 구매로그 발송
+    # 1) DM 전송
     dm_success = True
     try:
         dm_embed = discord.Embed(
@@ -626,7 +662,7 @@ async def process_purchase(interaction: discord.Interaction, item_name: str, qua
     except Exception:
         dm_success = False
 
-    # 2) 설정된 영수증 채널로 전송
+    # 2) 지정 영수증 채널 전송
     if setting_row and setting_row["receipt_channel_id"]:
         receipt_channel = interaction.guild.get_channel(setting_row["receipt_channel_id"])
         if receipt_channel:
@@ -703,9 +739,12 @@ class VendingMainView(discord.ui.View):
     @discord.ui.button(label="⚙️ 정보", style=discord.ButtonStyle.secondary, custom_id="vending_info")
     async def info_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         current_pts = get_user_points(interaction.guild_id, interaction.user.id)
+        tier_info = get_user_tier_info(interaction.guild_id, interaction.user.id)
         embed = discord.Embed(
             title="🤖 자판기 이용 정보",
-            description=f"내 잔액: **{fmt_won(current_pts)}**\n- 제품 구매 시 DM(개인메시지)로 계정 정보가 즉시 발송됩니다.",
+            description=f"내 잔액: **{fmt_won(current_pts)}**\n"
+                        f"내 등급: {tier_info['icon']} **{tier_info['name']}** ({int(tier_info['discount_rate']*100)}% 할인)\n\n"
+                        f"- 제품 구매 시 DM(개인메시지)로 계정 정보가 즉시 발송됩니다.",
             color=discord.Color.blurple()
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -776,8 +815,9 @@ class QuantityModal(discord.ui.Modal, title="🧮 수량 선택 및 가격 계�
             await interaction.response.send_message(f"❌ 재고가 부족합니다! (현재 남은 재고: {stock}개)", ephemeral=True)
             return
 
-        # 👑 5% VIP 영구 할인 계산
-        discount_rate, count, spent = get_user_discount_rate(interaction.guild_id, interaction.user.id)
+        # 👑 플래티넘 등급 할인 계산
+        tier_info = get_user_tier_info(interaction.guild_id, interaction.user.id)
+        discount_rate = tier_info["discount_rate"]
         discount_amount = int(raw_total_price * discount_rate)
         final_total_price = raw_total_price - discount_amount
 
@@ -789,14 +829,15 @@ class QuantityModal(discord.ui.Modal, title="🧮 수량 선택 및 가격 계�
         )
 
         if discount_rate > 0:
+            disc_pct = int(discount_rate * 100)
             desc += (
-                f"🎉 **VIP 영구 5% 할인 적용!** (`-{fmt_won(discount_amount)}`)\n"
+                f"🎉 {tier_info['icon']} **{tier_info['name']} {disc_pct}% 할인 적용!** (`-{fmt_won(discount_amount)}`)\n"
                 f"👉 **최종 결제 금액: `{fmt_won(final_total_price)}`**\n\n"
             )
         else:
             desc += (
                 f"👉 **총 예상 가격: `{fmt_won(final_total_price)}`**\n"
-                f"💡 *(현재 누적: {count}회 / {fmt_won(spent)} ➡️ 10회 또는 3만원 달성 시 5% 영구 할인!)*\n\n"
+                f"💡 *({tier_info['next_goal']})*\n\n"
             )
 
         desc += "구매를 진행하시겠습니까? 잔액에서 차감 후 DM으로 계정이 발송됩니다."
@@ -933,7 +974,7 @@ class TicketItemSelect(discord.ui.Select):
         await interaction.response.send_modal(QuantityModal(item_name))
 
 # ---------------------------------------------------------------------------
-# 패널 생성 명령어 (자판기 & 티켓 분리)
+# 패널 생성 명령어 (자판기 & 티켓)
 # ---------------------------------------------------------------------------
 @bot.tree.command(name="자판기패널", description="[관리자/판매자] 자판기 메인 패널을 전송합니다.")
 @admin_or_seller_only()
