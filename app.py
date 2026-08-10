@@ -48,13 +48,15 @@ class GatedCommandTree(app_commands.CommandTree):
             )
             return False
 
+        # 일반 유저가 이용 가능한 버튼/메뉴 ID 예외 처리
+        if interaction.data and interaction.data.get("custom_id") in [
+            "vending_buy", "vending_products", "vending_charge", "vending_info",
+            "select_category", "select_buy_item", "confirm_buy_item",
+            "open_ticket", "close_ticket", "ticket_buy", "select_ticket_item"
+        ]:
+            return True
+
         if not is_admin_or_seller(interaction):
-            if interaction.data and interaction.data.get("custom_id") in [
-                "vending_buy", "vending_products", "vending_charge", "vending_info",
-                "select_category", "select_buy_item", "confirm_buy_item"
-            ]:
-                return True
-            
             await interaction.response.send_message(
                 "❌ 이 기능은 관리자 또는 등록된 판매자만 사용할 수 있어요.",
                 ephemeral=True,
@@ -84,6 +86,7 @@ def init_db():
             price INTEGER NOT NULL,
             stock INTEGER DEFAULT -1,
             min_quantity INTEGER DEFAULT 1,
+            target_type TEXT DEFAULT 'vending',
             PRIMARY KEY (guild_id, item)
         )
     """)
@@ -160,9 +163,23 @@ def init_db():
             PRIMARY KEY (guild_id, user_id)
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ticket_logs (
+            channel_id INTEGER PRIMARY KEY,
+            guild_id INTEGER NOT NULL,
+            owner_id INTEGER NOT NULL,
+            opened_at TEXT NOT NULL
+        )
+    """)
 
+    # 마이그레이션 처리
     try:
         cur.execute("ALTER TABLE registered_guilds ADD COLUMN expires_at TEXT")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cur.execute("ALTER TABLE prices ADD COLUMN target_type TEXT DEFAULT 'vending'")
     except sqlite3.OperationalError:
         pass
 
@@ -277,9 +294,42 @@ def get_user_points(guild_id: int, user_id: int) -> int:
     conn.close()
     return row["points"] if row else 0
 
+def get_user_discount_rate(guild_id: int, user_id: int) -> tuple[float, int, int]:
+    """
+    유저의 누적 구매 횟수 및 금액을 확인하여 할인율을 반환합니다.
+    - 조건: 구매 10회 이상 OR 누적 금액 30,000원 이상 시 영구 5% 할인
+    - 반환값: (할인율, 누적 구매 횟수, 누적 결제 금액)
+    """
+    conn = get_conn()
+    row = conn.execute(
+        """
+        SELECT COUNT(*) as count, COALESCE(SUM(total_price), 0) as total_spent
+        FROM transactions
+        WHERE guild_id = ? AND buyer_id = ?
+        """,
+        (guild_id, user_id)
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        return 0.0, 0, 0
+
+    count = row["count"]
+    total_spent = row["total_spent"]
+
+    if count >= 10 or total_spent >= 30000:
+        return 0.05, count, total_spent
+    
+    return 0.0, count, total_spent
+
 @bot.event
 async def on_ready():
     init_db()
+    # 영구 뷰 등록 (봇 재시작 후에도 버튼 정상 작동)
+    bot.add_view(VendingMainView())
+    bot.add_view(TicketPanelView())
+    bot.add_view(TicketControlView())
+
     try:
         synced = await bot.tree.sync()
         print(f"슬래시 명령어 {len(synced)}개 동기화 완료")
@@ -376,7 +426,7 @@ async def set_receipt_channel(interaction: discord.Interaction, 채널: discord.
     await interaction.response.send_message(f"✅ 구매 영수증 채널이 {채널.mention} (으)로 설정되었습니다.", ephemeral=True)
 
 # ---------------------------------------------------------------------------
-# 관리자 및 판매자 기능 명령어
+# 관리자 및 판매자 기능 명령어 (자판기 / 티켓 구분 등록)
 # ---------------------------------------------------------------------------
 @bot.tree.command(name="판매자등록", description="[관리자] 특정 유저에게 패널 및 상품 관리 권한을 부여합니다.")
 @app_commands.describe(유저="판매자로 등록할 유저 멘션 (@유저)")
@@ -388,21 +438,38 @@ async def register_seller(interaction: discord.Interaction, 유저: discord.Memb
     add_bot_seller(interaction.guild_id, 유저.id, interaction.user.id)
     await interaction.response.send_message(f"✅ {유저.mention}님을 **판매자**로 등록했습니다.", ephemeral=True)
 
-@bot.tree.command(name="가격추가", description="[관리자/판매자] 새 상품을 등록합니다.")
-@app_commands.describe(상품명="상품 이름", 가격="가격(원)", 카테고리="카테고리 이름", 재고="초기 재고")
+@bot.tree.command(name="가격추가", description="[관리자/판매자] 새 상품을 등록합니다 (자판기/티켓 구분 가능).")
+@app_commands.describe(상품명="상품 이름", 가격="가격(원)", 카테고리="카테고리 이름", 재고="초기 재고", 구분="자판기 상품 또는 티켓 전용 상품")
+@app_commands.choices(구분=[
+    app_commands.Choice(name="자판기", value="vending"),
+    app_commands.Choice(name="티켓", value="ticket")
+])
 @admin_or_seller_only()
-async def add_price(interaction: discord.Interaction, 상품명: str, 가격: int, 카테고리: str = "기타", 재고: int = 0):
+async def add_price(
+    interaction: discord.Interaction, 
+    상품명: str, 
+    가격: int, 
+    카테고리: str = "기타", 
+    재고: int = 0,
+    구분: app_commands.Choice[str] = None
+):
+    target_type = 구분.value if 구분 else "vending"
+    type_kor = "자판기" if target_type == "vending" else "티켓"
+
     conn = get_conn()
     try:
-        conn.execute("INSERT INTO prices (guild_id, item, category, price, stock) VALUES (?, ?, ?, ?, ?)", (interaction.guild_id, 상품명, 카테고리, 가격, 재고))
+        conn.execute(
+            "INSERT INTO prices (guild_id, item, category, price, stock, target_type) VALUES (?, ?, ?, ?, ?, ?)", 
+            (interaction.guild_id, 상품명, 카테고리, 가격, 재고, target_type)
+        )
         conn.commit()
-        await interaction.response.send_message(f"✅ **[{카테고리}]** ➡️ **{상품명}** 상품 등록 완료! ({fmt_won(가격)})", ephemeral=True)
+        await interaction.response.send_message(f"✅ **[{type_kor} / {카테고리}]** ➡️ **{상품명}** 상품 등록 완료! ({fmt_won(가격)})", ephemeral=True)
     except sqlite3.IntegrityError:
         await interaction.response.send_message(f"⚠️ **{상품명}** 상품은 이미 존재합니다.", ephemeral=True)
     finally:
         conn.close()
 
-@bot.tree.command(name="재고등록", description="[관리자/판매자] 자판기 상품에 실제 계정/코드를 추가합니다.")
+@bot.tree.command(name="재고등록", description="[관리자/판매자] 상품에 실제 계정/코드를 추가합니다.")
 @app_commands.describe(상품명="등록된 상품 이름", 계정정보="지급될 텍스트 (예: id:a\npw:b)")
 @admin_or_seller_only()
 async def add_item_stock(interaction: discord.Interaction, 상품명: str, 계정정보: str):
@@ -441,9 +508,15 @@ async def manual_charge(interaction: discord.Interaction, 유저: discord.Member
 @bot.tree.command(name="포인트조회", description="내 남은 포인트 잔액을 확인합니다.")
 async def check_my_points(interaction: discord.Interaction):
     pts = get_user_points(interaction.guild_id, interaction.user.id)
+    discount_rate, count, spent = get_user_discount_rate(interaction.guild_id, interaction.user.id)
+    
+    vip_status = "👑 **VIP 회원 (영구 5% 할인 적용 중)**" if discount_rate > 0 else f"💡 일반 회원 *(누적: {count}회 / {fmt_won(spent)} ➡️ 10회 또는 3만원 달성 시 VIP)*"
+
     embed = discord.Embed(
-        title="💰 내 포인트 잔액",
-        description=f"{interaction.user.mention}님의 현재 잔액은 **{fmt_won(pts)}** 입니다.",
+        title="💰 내 포인트 잔액 및 등급",
+        description=f"{interaction.user.mention}님의 현재 정보입니다.\n\n"
+                    f"• **잔액:** `{fmt_won(pts)}`\n"
+                    f"• **등급:** {vip_status}",
         color=discord.Color.gold()
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -471,7 +544,107 @@ async def check_my_transactions(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # ---------------------------------------------------------------------------
-# 자판기 UI 및 가격 계산기 모달 시스템
+# 구매 처리 공통 헬퍼 함수 (구매 감사 로그 & VIP 할인 적용)
+# ---------------------------------------------------------------------------
+async def process_purchase(interaction: discord.Interaction, item_name: str, quantity: int, total_price: int, memo_text: str = "자판기 구매"):
+    guild_id = interaction.guild_id
+    user_id = interaction.user.id
+
+    my_pts = get_user_points(guild_id, user_id)
+    if my_pts < total_price:
+        await interaction.response.send_message(f"❌ 잔액이 부족합니다! (내 잔액: {fmt_won(my_pts)}, 필요 금액: {fmt_won(total_price)})", ephemeral=True)
+        return
+
+    conn = get_conn()
+    stock_rows = conn.execute("SELECT * FROM item_stocks WHERE guild_id = ? AND item = ? AND is_used = 0 LIMIT ?", (guild_id, item_name, quantity)).fetchall()
+    item_info = conn.execute("SELECT * FROM prices WHERE guild_id = ? AND item = ?", (guild_id, item_name)).fetchone()
+
+    if len(stock_rows) < quantity and item_info["stock"] != -1 and item_info["stock"] < quantity:
+        conn.close()
+        await interaction.response.send_message("❌ 처리 도중 재고가 부족해졌습니다.", ephemeral=True)
+        return
+
+    # 포인트 차감
+    conn.execute("UPDATE user_points SET points = points - ? WHERE guild_id = ? AND user_id = ?", (total_price, guild_id, user_id))
+
+    account_contents = []
+    for s_row in stock_rows:
+        account_contents.append(s_row["content"])
+        conn.execute("UPDATE item_stocks SET is_used = 1 WHERE id = ?", (s_row["id"],))
+
+    combined_accounts = "\n---\n".join(account_contents) if account_contents else "관리자에게 문의해주세요 (텍스트 재고 부족)"
+
+    # 재고 동기화
+    real_stock_count = conn.execute("SELECT COUNT(*) as cnt FROM item_stocks WHERE guild_id = ? AND item = ? AND is_used = 0", (guild_id, item_name)).fetchone()["cnt"]
+    new_stock = -1 if item_info["stock"] == -1 else real_stock_count
+    conn.execute("UPDATE prices SET stock = ? WHERE guild_id = ? AND item = ?", (new_stock, guild_id, item_name))
+
+    # 거래 기록 저장
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO transactions (guild_id, buyer_id, buyer_name, item, quantity, unit_price, total_price, memo, created_at, recorded_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'System')",
+        (guild_id, user_id, str(interaction.user), item_name, quantity, int(total_price/quantity), total_price, memo_text, now_kst_str())
+    )
+    tx_id = cur.lastrowid
+
+    # 영수증 채널 설정값 가져오기
+    setting_row = conn.execute("SELECT receipt_channel_id FROM guild_settings WHERE guild_id = ?", (guild_id,)).fetchone()
+
+    conn.commit()
+    conn.close()
+
+    # VIP 할인 적용 여부 확인
+    discount_rate, _, _ = get_user_discount_rate(guild_id, user_id)
+    discount_text = " (VIP 5% 할인 적용)" if discount_rate > 0 else ""
+
+    # 🎯 지정된 양식의 구매 로그 / 영수증 메시지 생성
+    receipt_text = (
+        f"구매로그는 {interaction.user.mention}\n"
+        f"구매 감사드립니다{discount_text}\n"
+        f"💰 {fmt_won(total_price)}\n"
+        f"📦 {item_name}\n"
+        f"🔢 {quantity}개"
+    )
+
+    receipt_embed = discord.Embed(
+        title=f"🧾 구매로그 [주문 #{tx_id}]",
+        description=receipt_text,
+        color=discord.Color.green(),
+        timestamp=datetime.now(KST)
+    )
+
+    # 1) DM으로 계정 및 구매로그 발송
+    dm_success = True
+    try:
+        dm_embed = discord.Embed(
+            title="🎉 [구매 성공] 상품 지급",
+            description=f"구매하신 상품 **{item_name}** ({quantity}개)의 계정 정보입니다:\n\n```text\n{combined_accounts}\n```",
+            color=discord.Color.gold()
+        )
+        await interaction.user.send(embed=dm_embed)
+        await interaction.user.send(embed=receipt_embed)
+    except Exception:
+        dm_success = False
+
+    # 2) 설정된 영수증 채널로 전송
+    if setting_row and setting_row["receipt_channel_id"]:
+        receipt_channel = interaction.guild.get_channel(setting_row["receipt_channel_id"])
+        if receipt_channel:
+            try:
+                await receipt_channel.send(embed=receipt_embed)
+            except Exception as e:
+                print(f"영수증 채널 전송 실패: {e}")
+
+    msg = f"✅ 총 **{quantity}개** 구매가 완료되었습니다!"
+    if not dm_success:
+        msg += f"\n⚠️ **DM 차단** 상태여서 발송 실패! 아래 계정 정보를 확인하세요:\n`{combined_accounts}`"
+    else:
+        msg += "\n📬 개인 메시지(DM)로 계정 정보와 구매로그가 발송되었습니다."
+
+    await interaction.response.send_message(msg, ephemeral=True)
+
+# ---------------------------------------------------------------------------
+# 자판기 UI 및 가격 계산기 모달
 # ---------------------------------------------------------------------------
 class VendingMainView(discord.ui.View):
     def __init__(self):
@@ -480,11 +653,11 @@ class VendingMainView(discord.ui.View):
     @discord.ui.button(label="🛒 구매", style=discord.ButtonStyle.primary, custom_id="vending_buy")
     async def buy_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         conn = get_conn()
-        rows = conn.execute("SELECT DISTINCT category FROM prices WHERE guild_id = ?", (interaction.guild_id,)).fetchall()
+        rows = conn.execute("SELECT DISTINCT category FROM prices WHERE guild_id = ? AND (target_type = 'vending' OR target_type IS NULL)", (interaction.guild_id,)).fetchall()
         conn.close()
 
         if not rows:
-            await interaction.response.send_message("⚠️ 등록된 카테고리가 없습니다.", ephemeral=True)
+            await interaction.response.send_message("⚠️ 등록된 자판기 카테고리가 없습니다.", ephemeral=True)
             return
 
         options = [discord.SelectOption(label=r["category"], value=r["category"]) for r in rows]
@@ -495,14 +668,14 @@ class VendingMainView(discord.ui.View):
     @discord.ui.button(label="🔍 제품", style=discord.ButtonStyle.secondary, custom_id="vending_products")
     async def products_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         conn = get_conn()
-        rows = conn.execute("SELECT * FROM prices WHERE guild_id = ? ORDER BY category, item", (interaction.guild_id,)).fetchall()
+        rows = conn.execute("SELECT * FROM prices WHERE guild_id = ? AND (target_type = 'vending' OR target_type IS NULL) ORDER BY category, item", (interaction.guild_id,)).fetchall()
         conn.close()
 
         if not rows:
-            await interaction.response.send_message("등록된 상품이 없어요.", ephemeral=True)
+            await interaction.response.send_message("등록된 자판기 상품이 없어요.", ephemeral=True)
             return
 
-        embed = discord.Embed(title="🛒 자판기 전체 상품 목록", color=discord.Color.blurple())
+        embed = discord.Embed(title="🛒 자판기 상품 목록", color=discord.Color.blurple())
         current_cat, desc = "", ""
         for r in rows:
             if current_cat != r["category"]:
@@ -544,11 +717,14 @@ class CategorySelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         selected_category = self.values[0]
         conn = get_conn()
-        rows = conn.execute("SELECT * FROM prices WHERE guild_id = ? AND category = ? AND (stock > 0 OR stock = -1)", (interaction.guild_id, selected_category)).fetchall()
+        rows = conn.execute(
+            "SELECT * FROM prices WHERE guild_id = ? AND category = ? AND (target_type = 'vending' OR target_type IS NULL) AND (stock > 0 OR stock = -1)", 
+            (interaction.guild_id, selected_category)
+        ).fetchall()
         conn.close()
 
         if not rows:
-            await interaction.response.send_message(f"⚠️ **{selected_category}** 카테고리에 구매 가능한 상품이 없습니다.", ephemeral=True)
+            await interaction.response.send_message(f"⚠️ **{selected_category}** 카테고리에 구매 가능한 자판기 상품이 없습니다.", ephemeral=True)
             return
 
         options = [discord.SelectOption(label=r['item'], description=f"단가: {fmt_won(r['price'])}", value=r['item']) for r in rows]
@@ -564,7 +740,7 @@ class VendingItemSelect(discord.ui.Select):
         item_name = self.values[0]
         await interaction.response.send_modal(QuantityModal(item_name))
 
-class QuantityModal(discord.ui.Modal, title="🧮 수량 선택 및 예상가격 계산기"):
+class QuantityModal(discord.ui.Modal, title="🧮 수량 선택 및 가격 계산기"):
     quantity_input = discord.ui.TextInput(
         label="구매할 개수 (숫자만 입력)",
         placeholder="예: 1 또는 3",
@@ -593,23 +769,44 @@ class QuantityModal(discord.ui.Modal, title="🧮 수량 선택 및 예상가격
             return
 
         unit_price = item_row["price"]
-        total_price = unit_price * qty
+        raw_total_price = unit_price * qty
         stock = item_row["stock"]
 
         if stock != -1 and stock < qty:
             await interaction.response.send_message(f"❌ 재고가 부족합니다! (현재 남은 재고: {stock}개)", ephemeral=True)
             return
 
+        # 👑 5% VIP 영구 할인 계산
+        discount_rate, count, spent = get_user_discount_rate(interaction.guild_id, interaction.user.id)
+        discount_amount = int(raw_total_price * discount_rate)
+        final_total_price = raw_total_price - discount_amount
+
+        desc = (
+            f"상품명: **{self.item_name}**\n"
+            f"• 구매 수량: **{qty}개**\n"
+            f"• 개당 단가: `{fmt_won(unit_price)}`\n"
+            f"• 정가 금액: `{fmt_won(raw_total_price)}`\n"
+        )
+
+        if discount_rate > 0:
+            desc += (
+                f"🎉 **VIP 영구 5% 할인 적용!** (`-{fmt_won(discount_amount)}`)\n"
+                f"👉 **최종 결제 금액: `{fmt_won(final_total_price)}`**\n\n"
+            )
+        else:
+            desc += (
+                f"👉 **총 예상 가격: `{fmt_won(final_total_price)}`**\n"
+                f"💡 *(현재 누적: {count}회 / {fmt_won(spent)} ➡️ 10회 또는 3만원 달성 시 5% 영구 할인!)*\n\n"
+            )
+
+        desc += "구매를 진행하시겠습니까? 잔액에서 차감 후 DM으로 계정이 발송됩니다."
+
         embed = discord.Embed(
-            title=f"🛒 구매 및 가격 계산 결과",
-            description=f"상품명: **{self.item_name}**\n"
-                        f"• 구매 수량: **{qty}개**\n"
-                        f"• 개당 단가: `{fmt_won(unit_price)}`\n"
-                        f"👉 **총 예상 가격: `{fmt_won(total_price)}`**\n\n"
-                        f"구매를 진행하시겠습니까? 잔액에서 차감 후 DM으로 계정이 발송됩니다.",
+            title="🛒 구매 및 가격 계산 결과",
+            description=desc,
             color=discord.Color.green()
         )
-        view = VendingConfirmView(self.item_name, qty, total_price)
+        view = VendingConfirmView(self.item_name, qty, final_total_price)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 class VendingConfirmView(discord.ui.View):
@@ -621,100 +818,122 @@ class VendingConfirmView(discord.ui.View):
 
     @discord.ui.button(label="✅ 최종 구매 확정", style=discord.ButtonStyle.danger, custom_id="confirm_buy_item")
     async def confirm_purchase(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild_id = interaction.guild_id
-        user_id = interaction.user.id
+        await process_purchase(interaction, self.item_name, self.quantity, self.total_price, memo_text="자판기 구매")
 
-        my_pts = get_user_points(guild_id, user_id)
-        if my_pts < self.total_price:
-            await interaction.response.send_message(f"❌ 잔액이 부족합니다! (내 잔액: {fmt_won(my_pts)}, 필요 금액: {fmt_won(self.total_price)})", ephemeral=True)
-            return
+# ---------------------------------------------------------------------------
+# 티켓 시스템 UI 및 30분 자동 타임아웃 처리
+# ---------------------------------------------------------------------------
+class TicketPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="🎫 티켓 열기", style=discord.ButtonStyle.primary, custom_id="open_ticket")
+    async def open_ticket_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        user = interaction.user
 
         conn = get_conn()
-        stock_rows = conn.execute("SELECT * FROM item_stocks WHERE guild_id = ? AND item = ? AND is_used = 0 LIMIT ?", (guild_id, self.item_name, self.quantity)).fetchall()
-        item_info = conn.execute("SELECT * FROM prices WHERE guild_id = ? AND item = ?", (guild_id, self.item_name)).fetchone()
+        existing = conn.execute("SELECT channel_id FROM ticket_logs WHERE guild_id = ? AND owner_id = ?", (guild.id, user.id)).fetchone()
+        if existing:
+            ch = guild.get_channel(existing["channel_id"])
+            if ch:
+                conn.close()
+                await interaction.response.send_message(f"⚠️ 이미 생성된 티켓 채널이 있습니다: {ch.mention}", ephemeral=True)
+                return
 
-        if len(stock_rows) < self.quantity and item_info["stock"] != -1 and item_info["stock"] < self.quantity:
-            conn.close()
-            await interaction.response.send_message("❌ 처리 도중 재고가 부족해졌습니다.", ephemeral=True)
-            return
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(read_messages=False),
+            user: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True),
+            guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True)
+        }
 
-        # 포인트 차감
-        conn.execute("UPDATE user_points SET points = points - ? WHERE guild_id = ? AND user_id = ?", (self.total_price, guild_id, user_id))
+        channel_name = f"티켓-{user.name}"
+        ticket_channel = await guild.create_text_channel(name=channel_name, overwrites=overwrites, reason=f"{user} 티켓 개설")
 
-        account_contents = []
-        for s_row in stock_rows:
-            account_contents.append(s_row["content"])
-            conn.execute("UPDATE item_stocks SET is_used = 1 WHERE id = ?", (s_row["id"],))
-
-        combined_accounts = "\n---\n".join(account_contents) if account_contents else "관리자에게 문의해주세요 (텍스트 재고 부족)"
-
-        # 재고 동기화
-        real_stock_count = conn.execute("SELECT COUNT(*) as cnt FROM item_stocks WHERE guild_id = ? AND item = ? AND is_used = 0", (guild_id, self.item_name)).fetchone()["cnt"]
-        new_stock = -1 if item_info["stock"] == -1 else real_stock_count
-        conn.execute("UPDATE prices SET stock = ? WHERE guild_id = ? AND item = ?", (new_stock, guild_id, self.item_name))
-
-        # 거래 기록 저장
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO transactions (guild_id, buyer_id, buyer_name, item, quantity, unit_price, total_price, memo, created_at, recorded_by) VALUES (?, ?, ?, ?, ?, ?, ?, '자판기 수량구매', ?, 'System')",
-            (guild_id, user_id, str(interaction.user), self.item_name, self.quantity, int(self.total_price/self.quantity), self.total_price, now_kst_str())
-        )
-        tx_id = cur.lastrowid
-
-        # 영수증 채널 설정값 가져오기
-        setting_row = conn.execute("SELECT receipt_channel_id FROM guild_settings WHERE guild_id = ?", (guild_id,)).fetchone()
-
+        conn.execute("INSERT INTO ticket_logs (channel_id, guild_id, owner_id, opened_at) VALUES (?, ?, ?, ?)", (ticket_channel.id, guild.id, user.id, now_kst_str()))
         conn.commit()
         conn.close()
 
-        # 🎯 요청해주신 서식으로 구매 로그/영수증 메시지 생성
-        receipt_text = (
-            f"구매로그는 {interaction.user.mention}\n"
-            f"구매 감사드립니다\n"
-            f"💰 {fmt_won(self.total_price)}\n"
-            f"📦 {self.item_name}\n"
-            f"🔢 {self.quantity}개"
+        embed = discord.Embed(
+            title=f"🎫 {user.display_name}님의 티켓",
+            description="상담 및 티켓 전용 상품 구매 채널입니다.\n\n"
+                        "⚠️ **[안내사항]**\n"
+                        "티켓을 닫으시면 자동 **30분 타임아웃**이 적용되어 30분간 메시지 작성이 제한됩니다.",
+            color=discord.Color.blue()
         )
+        await ticket_channel.send(content=f"{user.mention} 님, 티켓이 생성되었습니다.", embed=embed, view=TicketControlView())
+        await interaction.response.send_message(f"✅ 티켓 채널이 생성되었습니다: {ticket_channel.mention}", ephemeral=True)
 
-        receipt_embed = discord.Embed(
-            title=f"🧾 구매로그 [주문 #{tx_id}]",
-            description=receipt_text,
-            color=discord.Color.green(),
-            timestamp=datetime.now(KST)
-        )
+class TicketControlView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
 
-        # 1) DM으로 상품 및 구매로그 발송
-        dm_success = True
-        try:
-            dm_embed = discord.Embed(
-                title="🎉 [구매 성공] 자판기 상품 지급",
-                description=f"구매하신 상품 **{self.item_name}** ({self.quantity}개)의 계정 정보입니다:\n\n```text\n{combined_accounts}\n```",
-                color=discord.Color.gold()
-            )
-            await interaction.user.send(embed=dm_embed)
-            await interaction.user.send(embed=receipt_embed)
-        except Exception:
-            dm_success = False
+    @discord.ui.button(label="🛒 티켓 상품 구매", style=discord.ButtonStyle.success, custom_id="ticket_buy")
+    async def ticket_buy_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        conn = get_conn()
+        rows = conn.execute("SELECT * FROM prices WHERE guild_id = ? AND target_type = 'ticket' AND (stock > 0 OR stock = -1)", (interaction.guild_id,)).fetchall()
+        conn.close()
 
-        # 2) 설정된 영수증 채널로 전송
-        if setting_row and setting_row["receipt_channel_id"]:
-            receipt_channel = interaction.guild.get_channel(setting_row["receipt_channel_id"])
-            if receipt_channel:
+        if not rows:
+            await interaction.response.send_message("⚠️ 현재 구매 가능한 티켓 전용 상품이 없습니다.", ephemeral=True)
+            return
+
+        options = [discord.SelectOption(label=r['item'], description=f"가격: {fmt_won(r['price'])}", value=r['item']) for r in rows]
+        view = discord.ui.View()
+        view.add_item(TicketItemSelect(options))
+        await interaction.response.send_message("🎫 **티켓 전용 상품을 선택하세요:**", view=view, ephemeral=True)
+
+    @discord.ui.button(label="🔒 티켓 닫기", style=discord.ButtonStyle.danger, custom_id="close_ticket")
+    async def close_ticket_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        channel_id = interaction.channel_id
+        conn = get_conn()
+        t_row = conn.execute("SELECT * FROM ticket_logs WHERE channel_id = ?", (channel_id,)).fetchone()
+        
+        owner_id = t_row["owner_id"] if t_row else interaction.user.id
+        conn.execute("DELETE FROM ticket_logs WHERE channel_id = ?", (channel_id,))
+        conn.commit()
+        conn.close()
+
+        guild = interaction.guild
+        member = guild.get_member(owner_id)
+
+        timeout_notice = "📢 **티켓이 종료되어 30분 동안 자동 타임아웃이 적용됩니다.**"
+        await interaction.response.send_message(timeout_notice)
+
+        if member:
+            try:
+                await member.timeout(timedelta(minutes=30), reason="티켓 종료 후 자동 30분 타임아웃")
+                
                 try:
-                    await receipt_channel.send(embed=receipt_embed)
-                except Exception as e:
-                    print(f"영수증 채널 전송 실패: {e}")
+                    dm_embed = discord.Embed(
+                        title="⏳ 티켓 종료 및 타임아웃 안내",
+                        description=f"**[{guild.name}]** 서버에서 티켓이 종료되어 **30분간 타임아웃** 조치가 적용되었습니다.\n30분 후 제한이 해제됩니다.",
+                        color=discord.Color.red()
+                    )
+                    await member.send(embed=dm_embed)
+                except Exception:
+                    pass
+            except discord.Forbidden:
+                await interaction.channel.send("⚠️ 봇 권한 부족으로 타임아웃을 적용하지 못했습니다.")
+            except Exception as e:
+                await interaction.channel.send(f"⚠️ 타임아웃 처리 중 오류 발생: {e}")
 
-        msg = f"✅ 총 **{self.quantity}개** 구매가 완료되었습니다!"
-        if not dm_success:
-            msg += f"\n⚠️ **DM 차단** 상태여서 발송 실패! 관리자에게 문의하세요:\n`{combined_accounts}`"
-        else:
-            msg += "\n📬 개인 메시지(DM)로 계정 정보와 영수증이 발송되었습니다."
+        await asyncio.sleep(5)
+        try:
+            await interaction.channel.delete(reason="티켓 닫기 처리")
+        except Exception:
+            pass
 
-        await interaction.response.send_message(msg, ephemeral=True)
+class TicketItemSelect(discord.ui.Select):
+    def __init__(self, options):
+        super().__init__(placeholder="구매할 티켓 상품 선택", options=options, custom_id="select_ticket_item")
+
+    async def callback(self, interaction: discord.Interaction):
+        item_name = self.values[0]
+        await interaction.response.send_modal(QuantityModal(item_name))
 
 # ---------------------------------------------------------------------------
-# 자판기 메인 패널 생성 명령어
+# 패널 생성 명령어 (자판기 & 티켓 분리)
 # ---------------------------------------------------------------------------
 @bot.tree.command(name="자판기패널", description="[관리자/판매자] 자판기 메인 패널을 전송합니다.")
 @admin_or_seller_only()
@@ -730,6 +949,23 @@ async def vending_panel(interaction: discord.Interaction):
     view = VendingMainView()
     await interaction.channel.send(embed=embed, view=view)
     await interaction.response.send_message("✅ 자판기 패널이 생성되었습니다.", ephemeral=True)
+
+@bot.tree.command(name="티켓패널", description="[관리자/판매자] 티켓 상담 및 티켓 상품 구매 패널을 전송합니다.")
+@admin_or_seller_only()
+async def ticket_panel(interaction: discord.Interaction):
+    server_name = interaction.guild.name if interaction.guild else "서버"
+    
+    embed = discord.Embed(
+        title=f"🎫 {server_name} 문의 및 지원 티켓",
+        description="아래 **[🎫 티켓 열기]** 버튼을 눌러 문의 및 티켓 전용 상품 구매를 진행하세요.\n\n"
+                    "⚠️ **[주의사항]**\n"
+                    "티켓을 열었다가 닫으시면 **30분 자동 타임아웃**이 적용됩니다.",
+        color=discord.Color.green()
+    )
+    embed.set_thumbnail(url=interaction.guild.icon.url if interaction.guild and interaction.guild.icon else None)
+    view = TicketPanelView()
+    await interaction.channel.send(embed=embed, view=view)
+    await interaction.response.send_message("✅ 티켓 패널이 생성되었습니다.", ephemeral=True)
 
 if __name__ == "__main__":
     if not TOKEN:
