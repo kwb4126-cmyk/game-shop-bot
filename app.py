@@ -5,6 +5,7 @@ import threading
 import asyncio
 import urllib.request
 import urllib.parse
+import urllib.error
 import json
 import secrets
 from datetime import datetime, timezone, timedelta
@@ -25,12 +26,22 @@ ADMIN_ROLE_NAME = os.getenv("ADMIN_ROLE_NAME", "! !디노")
 DB_PATH = os.getenv("DB_PATH", "shop.db")
 KST = timezone(timedelta(hours=9))
 
+# ⚠️ CLIENT_ID(애플리케이션 ID)는 공개 정보라 기본값을 둬도 되지만,
+# CLIENT_SECRET은 절대 코드에 직접 쓰면 안 됩니다. 반드시 환경변수로만 설정하세요.
 CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "1535126290221367316")
-CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "tr_U-UB3Qa1RgTxCy8nk8sZbveJKAqZW")
-REDIRECT_URI = os.getenv("REDIRECT_URI", "https://너의도메인주소.dishost.kr/callback")
+CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
+REDIRECT_URI = os.getenv("REDIRECT_URI")  # 예: https://your-domain.com/callback
+VERIFY_ROLE_ID = os.getenv("VERIFY_ROLE_ID")  # 인증 완료 시 부여할 역할 ID
 
-# 웹 관리자로 인정할 디스코드 사용자 ID 목록 (필요에 따라 본인 ID 추가)
-WEB_ADMIN_DISCORD_IDS = ["123456789012345678"]
+if not CLIENT_SECRET:
+    print("⚠️ DISCORD_CLIENT_SECRET 환경변수가 없어요. /인증패널 기능이 작동하지 않습니다.")
+if not REDIRECT_URI:
+    print("⚠️ REDIRECT_URI 환경변수가 없어요. /인증패널 기능이 작동하지 않습니다.")
+if not VERIFY_ROLE_ID:
+    print("⚠️ VERIFY_ROLE_ID 환경변수가 없어요. 인증해도 역할이 부여되지 않습니다.")
+
+# 웹 관리자로 인정할 디스코드 사용자 ID 목록 (본인 ID로 반드시 교체해주세요)
+WEB_ADMIN_DISCORD_IDS = [uid.strip() for uid in os.getenv("WEB_ADMIN_DISCORD_IDS", "").split(",") if uid.strip()]
 
 intents = discord.Intents.default()
 intents.members = True          
@@ -99,11 +110,33 @@ def api_use_key():
     
     return json.dumps({"success": True, "message": "복구키가 성공적으로 인증 및 등록되었습니다!"}), 200, {"Content-Type": "application/json"}
 
+def discord_api_request(method: str, path: str, token: str, token_type: str = "Bot", body: dict = None):
+    """Discord REST API 호출용 경량 헬퍼 (urllib만 사용, 추가 의존성 없음)."""
+    url = f"https://discord.com/api{path}"
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method, headers={
+        "Authorization": f"{token_type} {token}",
+        "Content-Type": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req) as response:
+            raw = response.read()
+            return response.status, (json.loads(raw) if raw else {})
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        try:
+            return e.code, json.loads(raw) if raw else {}
+        except Exception:
+            return e.code, {}
+
+
 @app.route("/callback")
 def callback():
     code = request.args.get("code")
     if not code:
         return "인증 실패: 코드가 존재하지 않습니다."
+    if not CLIENT_SECRET or not REDIRECT_URI:
+        return "서버 설정 오류: DISCORD_CLIENT_SECRET / REDIRECT_URI 환경변수가 설정되지 않았습니다."
 
     data = urllib.parse.urlencode({
         "client_id": CLIENT_ID,
@@ -132,6 +165,31 @@ def callback():
         return f"사용자 정보 조회 실패: {e}"
 
     username = user_data.get("username", "사용자")
+    user_id = user_data.get("id")
+
+    # state 파라미터로 어느 서버에서 인증을 시작했는지 전달받음 (인증 패널 버튼 생성 시 서버 ID를 넣어둠)
+    guild_id = request.args.get("state")
+    join_status = "미처리"
+
+    if guild_id and TOKEN:
+        # 1. 기존 역할 확인 (이미 서버원이면 역할이 덮어써지지 않도록)
+        status, member_data = discord_api_request("GET", f"/guilds/{guild_id}/members/{user_id}", TOKEN)
+        existing_roles = member_data.get("roles", []) if status == 200 else []
+        new_roles = list(set(existing_roles + ([VERIFY_ROLE_ID] if VERIFY_ROLE_ID else [])))
+
+        # 2. 서버 입장 처리 (access_token으로 guilds.join 스코프 사용, 이미 서버원이면 204 응답)
+        join_body = {"access_token": access_token}
+        if new_roles:
+            join_body["roles"] = new_roles
+        status, _ = discord_api_request("PUT", f"/guilds/{guild_id}/members/{user_id}", TOKEN, body=join_body)
+
+        # 3. 역할 부여를 확실히 하기 위해 한 번 더 명시적으로 반영 (이미 서버원인 경우 대비)
+        if new_roles:
+            discord_api_request("PATCH", f"/guilds/{guild_id}/members/{user_id}", TOKEN, body={"roles": new_roles})
+
+        join_status = "정상 처리됨" if status in (200, 201, 204) else f"오류 (코드 {status})"
+    elif not guild_id:
+        join_status = "서버 정보 없음 (인증 패널을 통해 다시 시도해주세요)"
 
     success_html = """
     <!DOCTYPE html>
@@ -153,8 +211,8 @@ def callback():
                     <span class="font-semibold text-slate-700">{{ username }}</span>
                 </div>
                 <div class="flex justify-between items-center py-2 text-sm">
-                    <span class="text-slate-400">인증 상태</span>
-                    <span class="font-semibold text-emerald-600">정상 처리됨</span>
+                    <span class="text-slate-400">서버 입장 / 역할 부여</span>
+                    <span class="font-semibold text-emerald-600">{{ join_status }}</span>
                 </div>
             </div>
             <p class="text-slate-400 text-xs mb-6">이제 브라우저 창을 닫고 디스코드 앱으로 돌아가셔도 좋습니다.</p>
@@ -162,7 +220,7 @@ def callback():
     </body>
     </html>
     """
-    return render_template_string(success_html, username=username)
+    return render_template_string(success_html, username=username, join_status=join_status)
 
 def run_flask():
     app.run(host="0.0.0.0", port=8080)
@@ -458,16 +516,33 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
 # 웹 인증 UI 버튼 및 패널
 # ---------------------------------------------------------------------------
 class VerificationView(discord.ui.View):
-    def __init__(self):
+    def __init__(self, guild_id: int):
         super().__init__(timeout=None)
-        oauth_url = f"https://discord.com/api/oauth2/authorize?client_id={CLIENT_ID}&redirect_uri={urllib.parse.quote(REDIRECT_URI)}&response_type=code&scope=identify"
+        oauth_url = (
+            "https://discord.com/api/oauth2/authorize"
+            f"?client_id={CLIENT_ID}"
+            f"&redirect_uri={urllib.parse.quote(REDIRECT_URI or '')}"
+            "&response_type=code"
+            "&scope=identify%20guilds.join"
+            f"&state={guild_id}"
+        )
         self.add_item(discord.ui.Button(label="인증하기", style=discord.ButtonStyle.link, url=oauth_url))
 
-@bot.tree.command(name="인증패널", description="[관리자] 유저 인증용 패널을 전송합니다.")
+@bot.tree.command(name="인증패널", description="[관리자] 유저 인증(서버 자동 입장 + 역할 부여)용 패널을 전송합니다.")
 @admin_only()
 async def verification_panel(interaction: discord.Interaction):
-    embed = discord.Embed(title="서버 멤버 인증", description="아래 **인증하기** 버튼을 눌러 OAuth2 승인을 진행해주세요.", color=discord.Color.blurple())
-    await interaction.channel.send(embed=embed, view=VerificationView())
+    if not CLIENT_SECRET or not REDIRECT_URI:
+        await interaction.response.send_message(
+            "⚠️ DISCORD_CLIENT_SECRET / REDIRECT_URI 환경변수가 설정되지 않아서 인증 패널을 만들 수 없어요.",
+            ephemeral=True,
+        )
+        return
+    embed = discord.Embed(
+        title="서버 멤버 인증",
+        description="아래 **인증하기** 버튼을 눌러 OAuth2 승인을 진행해주세요.\n승인하면 자동으로 서버 입장과 역할 부여가 처리돼요.",
+        color=discord.Color.blurple(),
+    )
+    await interaction.channel.send(embed=embed, view=VerificationView(interaction.guild_id))
     await interaction.response.send_message("✅ 인증 패널이 생성되었습니다.", ephemeral=True)
 
 # ---------------------------------------------------------------------------
