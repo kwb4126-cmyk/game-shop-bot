@@ -26,8 +26,6 @@ ADMIN_ROLE_NAME = os.getenv("ADMIN_ROLE_NAME", "! !디노")
 DB_PATH = os.getenv("DB_PATH", "shop.db")
 KST = timezone(timedelta(hours=9))
 
-# ⚠️ CLIENT_ID(애플리케이션 ID)는 공개 정보라 기본값을 둬도 되지만,
-# CLIENT_SECRET은 절대 코드에 직접 쓰면 안 됩니다. 반드시 환경변수로만 설정하세요.
 CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "1535126290221367316")
 CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
 REDIRECT_URI = os.getenv("REDIRECT_URI")  # 예: https://your-domain.com/callback
@@ -40,7 +38,6 @@ if not REDIRECT_URI:
 if not VERIFY_ROLE_ID:
     print("⚠️ VERIFY_ROLE_ID 환경변수가 없어요. 인증해도 역할이 부여되지 않습니다.")
 
-# 웹 관리자로 인정할 디스코드 사용자 ID 목록 (본인 ID로 반드시 교체해주세요)
 WEB_ADMIN_DISCORD_IDS = [uid.strip() for uid in os.getenv("WEB_ADMIN_DISCORD_IDS", "").split(",") if uid.strip()]
 
 intents = discord.Intents.default()
@@ -48,17 +45,62 @@ intents.members = True
 intents.message_content = True  
 
 # ---------------------------------------------------------------------------
-# Flask 웹서버 (OAuth2 인증 및 복구키 API 처리)
+# Flask 웹서버 및 내장 웹 UI (HTML을 파이썬 안에 포함)
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
 
+INDEX_HTML = """
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>디스코드 봇 통합 관리 & 인증 센터</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-100 min-h-screen flex items-center justify-center p-4">
+    <div class="max-w-md w-full bg-white rounded-3xl p-8 shadow-xl border border-slate-100">
+        <div class="w-14 h-14 bg-indigo-50 text-indigo-500 rounded-full flex items-center justify-center mx-auto mb-4 text-xl font-black border border-indigo-100">🤖</div>
+        <h1 class="text-2xl font-bold text-slate-800 text-center mb-2">서버 관리 센터</h1>
+        <p class="text-slate-500 text-sm text-center mb-6">복구키 생성 및 계정 인증 처리 시스템입니다.</p>
+        
+        <div class="space-y-4">
+            <div class="bg-slate-50 p-4 rounded-2xl border border-slate-100">
+                <h2 class="text-sm font-semibold text-slate-700 mb-2">🔑 복구키 사용</h2>
+                <form id="useKeyForm" onsubmit="useKey(event)" class="space-y-3">
+                    <input type="text" id="discordId" placeholder="디스코드 숫자 ID" required class="w-full px-3 py-2 text-sm bg-white border border-slate-200 rounded-xl focus:outline-none focus:border-indigo-500">
+                    <input type="text" id="recoveryKey" placeholder="복구키 (XXXX-XXXX)" required class="w-full px-3 py-2 text-sm bg-white border border-slate-200 rounded-xl focus:outline-none focus:border-indigo-500">
+                    <button type="submit" class="w-full py-2.5 bg-indigo-600 text-white font-medium text-sm rounded-xl hover:bg-indigo-700 transition">복구키 제출</button>
+                </form>
+                <div id="useResult" class="mt-2 text-xs text-center font-medium"></div>
+            </div>
+        </div>
+    </div>
+    <script>
+        async function useKey(e) {
+            e.preventDefault();
+            const discord_id = document.getElementById('discordId').value;
+            const recovery_key = document.getElementById('recoveryKey').value;
+            const resDiv = document.getElementById('useResult');
+            
+            const formData = new URLSearchParams();
+            formData.append('discord_id', discord_id);
+            formData.append('recovery_key', recovery_key);
+
+            const response = await fetch('/api/use-key', { method: 'POST', body: formData });
+            const data = await response.json();
+            
+            resDiv.textContent = data.message || data.detail;
+            resDiv.className = data.success ? "mt-2 text-xs text-center font-medium text-emerald-600" : "mt-2 text-xs text-center font-medium text-rose-600";
+        }
+    </script>
+</body>
+</html>
+"""
+
 @app.route("/")
 def home():
-    try:
-        with open("index.html", "r", encoding="utf-8") as f:
-            return f.read()
-    except FileNotFoundError:
-        return "index.html 파일이 업로드되지 않았습니다."
+    return render_template_string(INDEX_HTML)
 
 @app.route("/api/generate-key", methods=["POST"])
 def api_generate_key():
@@ -111,7 +153,6 @@ def api_use_key():
     return json.dumps({"success": True, "message": "복구키가 성공적으로 인증 및 등록되었습니다!"}), 200, {"Content-Type": "application/json"}
 
 def discord_api_request(method: str, path: str, token: str, token_type: str = "Bot", body: dict = None):
-    """Discord REST API 호출용 경량 헬퍼 (urllib만 사용, 추가 의존성 없음)."""
     url = f"https://discord.com/api{path}"
     data = json.dumps(body).encode("utf-8") if body is not None else None
     req = urllib.request.Request(url, data=data, method=method, headers={
@@ -128,7 +169,6 @@ def discord_api_request(method: str, path: str, token: str, token_type: str = "B
             return e.code, json.loads(raw) if raw else {}
         except Exception:
             return e.code, {}
-
 
 @app.route("/callback")
 def callback():
@@ -167,23 +207,19 @@ def callback():
     username = user_data.get("username", "사용자")
     user_id = user_data.get("id")
 
-    # state 파라미터로 어느 서버에서 인증을 시작했는지 전달받음 (인증 패널 버튼 생성 시 서버 ID를 넣어둠)
     guild_id = request.args.get("state")
     join_status = "미처리"
 
     if guild_id and TOKEN:
-        # 1. 기존 역할 확인 (이미 서버원이면 역할이 덮어써지지 않도록)
         status, member_data = discord_api_request("GET", f"/guilds/{guild_id}/members/{user_id}", TOKEN)
         existing_roles = member_data.get("roles", []) if status == 200 else []
         new_roles = list(set(existing_roles + ([VERIFY_ROLE_ID] if VERIFY_ROLE_ID else [])))
 
-        # 2. 서버 입장 처리 (access_token으로 guilds.join 스코프 사용, 이미 서버원이면 204 응답)
         join_body = {"access_token": access_token}
         if new_roles:
             join_body["roles"] = new_roles
         status, _ = discord_api_request("PUT", f"/guilds/{guild_id}/members/{user_id}", TOKEN, body=join_body)
 
-        # 3. 역할 부여를 확실히 하기 위해 한 번 더 명시적으로 반영 (이미 서버원인 경우 대비)
         if new_roles:
             discord_api_request("PATCH", f"/guilds/{guild_id}/members/{user_id}", TOKEN, body={"roles": new_roles})
 
@@ -533,7 +569,7 @@ class VerificationView(discord.ui.View):
 async def verification_panel(interaction: discord.Interaction):
     if not CLIENT_SECRET or not REDIRECT_URI:
         await interaction.response.send_message(
-            "⚠️ DISCORD_CLIENT_SECRET / REDIRECT_URI 환경변수가 설정되지 않아서 인증 패널을 만들 수 없어요.",
+            "⚠️ DISCORD_CLIENT_SECRET / REDIRECT_URI 환경변수가 설정되지 않았아서 인증 패널을 만들 수 없어요.",
             ephemeral=True,
         )
         return
@@ -1136,9 +1172,7 @@ if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("❌ DISCORD_TOKEN 환경변수가 설정되지 않았어요.")
     
-    # Flask 서버 백그라운드 동시 실행
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
 
-    # 디스코드 봇 실행
     bot.run(TOKEN)
