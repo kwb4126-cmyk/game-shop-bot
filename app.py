@@ -1,20 +1,13 @@
 # -*- coding: utf-8 -*-
 import os
 import sqlite3
-import threading
 import asyncio
-import urllib.request
-import urllib.parse
-import urllib.error
-import json
-import secrets
 from datetime import datetime, timezone, timedelta
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
-from flask import Flask, request, render_template_string
 
 # ---------------------------------------------------------------------------
 # 환경변수 및 기본 설정
@@ -26,266 +19,9 @@ ADMIN_ROLE_NAME = os.getenv("ADMIN_ROLE_NAME", "! !디노")
 DB_PATH = os.getenv("DB_PATH", "shop.db")
 KST = timezone(timedelta(hours=9))
 
-CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "1535126290221367316")
-CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
-REDIRECT_URI = os.getenv("REDIRECT_URI")  # 예: https://your-domain.com/callback
-VERIFY_ROLE_ID = os.getenv("VERIFY_ROLE_ID")  # 인증 완료 시 부여할 역할 ID
-
-if not CLIENT_SECRET:
-    print("⚠️ DISCORD_CLIENT_SECRET 환경변수가 없어요. /인증패널 기능이 작동하지 않습니다.")
-if not REDIRECT_URI:
-    print("⚠️ REDIRECT_URI 환경변수가 없어요. /인증패널 기능이 작동하지 않습니다.")
-if not VERIFY_ROLE_ID:
-    print("⚠️ VERIFY_ROLE_ID 환경변수가 없어요. 인증해도 역할이 부여되지 않습니다.")
-
-WEB_ADMIN_DISCORD_IDS = [uid.strip() for uid in os.getenv("WEB_ADMIN_DISCORD_IDS", "").split(",") if uid.strip()]
-
 intents = discord.Intents.default()
 intents.members = True          
 intents.message_content = True  
-
-# ---------------------------------------------------------------------------
-# Flask 웹서버 및 내장 웹 UI (HTML을 파이썬 안에 포함)
-# ---------------------------------------------------------------------------
-app = Flask(__name__)
-
-INDEX_HTML = """
-<!DOCTYPE html>
-<html lang="ko">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>디스코드 봇 통합 관리 & 복구키 인증 센터</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-</head>
-<body class="bg-slate-100 min-h-screen flex items-center justify-center p-4">
-    <div class="max-w-md w-full bg-white rounded-3xl p-8 shadow-xl border border-slate-100">
-        <div class="w-14 h-14 bg-indigo-50 text-indigo-500 rounded-full flex items-center justify-center mx-auto mb-4 text-xl font-black border border-indigo-100">🤖</div>
-        <h1 class="text-2xl font-bold text-slate-800 text-center mb-2">서버 통합 관리 센터</h1>
-        <p class="text-slate-500 text-sm text-center mb-6">무제한 복구키 생성 및 서버 이동/인증 처리 시스템입니다.</p>
-        
-        <div class="space-y-4">
-            <div class="bg-slate-50 p-4 rounded-2xl border border-slate-100">
-                <h2 class="text-sm font-semibold text-slate-700 mb-2">🔑 복구키 제출 (서버 자동 이동)</h2>
-                <form id="useKeyForm" onsubmit="useKey(event)" class="space-y-3">
-                    <input type="text" id="discordId" placeholder="디스코드 숫자 ID (예: 123456789...)" required class="w-full px-3 py-2 text-sm bg-white border border-slate-200 rounded-xl focus:outline-none focus:border-indigo-500">
-                    <input type="text" id="recoveryKey" placeholder="복구키 (XXXX-XXXX)" required class="w-full px-3 py-2 text-sm bg-white border border-slate-200 rounded-xl focus:outline-none focus:border-indigo-500">
-                    <button type="submit" class="w-full py-2.5 bg-indigo-600 text-white font-medium text-sm rounded-xl hover:bg-indigo-700 transition">복구키 제출 및 서버 연동</button>
-                </form>
-                <div id="useResult" class="mt-2 text-xs text-center font-medium"></div>
-            </div>
-        </div>
-    </div>
-    <script>
-        async function useKey(e) {
-            e.preventDefault();
-            const discord_id = document.getElementById('discordId').value;
-            const recovery_key = document.getElementById('recoveryKey').value;
-            const resDiv = document.getElementById('useResult');
-            
-            const formData = new URLSearchParams();
-            formData.append('discord_id', discord_id);
-            formData.append('recovery_key', recovery_key);
-
-            try {
-                const response = await fetch('/api/use-key', { method: 'POST', body: formData });
-                const data = await response.json();
-                
-                resDiv.textContent = data.message || data.detail;
-                resDiv.className = data.success ? "mt-2 text-xs text-center font-medium text-emerald-600" : "mt-2 text-xs text-center font-medium text-rose-600";
-            } catch (err) {
-                resDiv.textContent = "서버 통신 중 오류가 발생했습니다.";
-                resDiv.className = "mt-2 text-xs text-center font-medium text-rose-600";
-            }
-        }
-    </script>
-</body>
-</html>
-"""
-
-@app.route("/")
-def home():
-    return render_template_string(INDEX_HTML)
-
-def discord_api_request(method: str, path: str, token: str, token_type: str = "Bot", body: dict = None):
-    url = f"https://discord.com/api{path}"
-    data = json.dumps(body).encode("utf-8") if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method, headers={
-        "Authorization": f"{token_type} {token}",
-        "Content-Type": "application/json",
-    })
-    try:
-        with urllib.request.urlopen(req) as response:
-            raw = response.read()
-            return response.status, (json.loads(raw) if raw else {})
-    except urllib.error.HTTPError as e:
-        raw = e.read()
-        try:
-            return e.code, json.loads(raw) if raw else {}
-        except Exception:
-            return e.code, {}
-
-@app.route("/api/use-key", methods=["POST"])
-def api_use_key():
-    recovery_key = request.form.get("recovery_key")
-    discord_id = request.form.get("discord_id")
-    
-    if not recovery_key or not discord_id:
-        return json.dumps({"success": False, "detail": "모든 항목을 입력해주세요."}), 400, {"Content-Type": "application/json"}
-
-    conn = get_conn()
-    row = conn.execute("SELECT id, guild_id, is_used FROM recovery_keys WHERE recovery_key = ?", (recovery_key,)).fetchone()
-    
-    if not row:
-        conn.close()
-        return json.dumps({"success": False, "detail": "존재하지 않는 복구키입니다."}), 400, {"Content-Type": "application/json"}
-    
-    key_id, target_guild_id, is_used = row["id"], row["guild_id"], row["is_used"]
-    
-    if is_used == 1:
-        conn.close()
-        return json.dumps({"success": False, "detail": "이미 사용된 복구키입니다."}), 400, {"Content-Type": "application/json"}
-    
-    # 봇 토큰을 이용해 해당 사용자(discord_id)를 target_guild_id 서버에 강제 추가 (OAuth2 토큰 없이 봇 권한으로 추가 불가하므로, 
-    # 만약 유저의 OAuth 토큰이 없다면 시스템적으로는 API 제약이 있으나, 
-    # 본 프로젝트의 인증패널 OAuth 플로우나 별도 연동을 통해 처리하거나 bot구조 내 add member endpoint 이용)
-    # 참고: Discord API에서 봇이 사용자를 서버에 넣으려면 사용자의 guilds.join OAuth2 access_token이 필수적입니다.
-    # 만약 복구키 입력만으로 넣으려면 사용자가 사전에 인증패널을 거쳤거나 OAuth 토큰이 저장되어 있어야 합니다.
-    # 여기서는 복구키 테이블에 연동된 유저의 access_token이 함께 저장되어 있거나 인증 연동이 되어있을 때 처리하도록 구성합니다.
-    
-    token_row = conn.execute("SELECT access_token FROM oauth_tokens WHERE user_id = ?", (discord_id,)).fetchone()
-    
-    if not token_row or not token_row["access_token"]:
-        conn.close()
-        return json.dumps({
-            "success": False, 
-            "detail": "해당 디스코드 계정의 인증 정보(OAuth 토큰)가 없습니다. 먼저 디스코드 봇을 통해 인증을 진행해주세요."
-        }), 400, {"Content-Type": "application/json"}
-
-    user_access_token = token_row["access_token"]
-    
-    # B서버(target_guild_id)로 유저 추가 시도
-    status, member_data = discord_api_request("GET", f"/guilds/{target_guild_id}/members/{discord_id}", TOKEN)
-    existing_roles = member_data.get("roles", []) if status == 200 else []
-    new_roles = list(set(existing_roles + ([VERIFY_ROLE_ID] if VERIFY_ROLE_ID else [])))
-
-    join_body = {"access_token": user_access_token}
-    if new_roles:
-        join_body["roles"] = new_roles
-        
-    put_status, _ = discord_api_request("PUT", f"/guilds/{target_guild_id}/members/{discord_id}", TOKEN, body=join_body)
-    if new_roles:
-        discord_api_request("PATCH", f"/guilds/{target_guild_id}/members/{discord_id}", TOKEN, body={"roles": new_roles})
-
-    if put_status not in (200, 201, 204):
-        conn.close()
-        return json.dumps({"success": False, "detail": f"서버 입장 처리 중 오류가 발생했습니다. (오류코드: {put_status})유저가 해당 앱을 통해 인증한 적이 있는지 확인해주세요."}), 500, {"Content-Type": "application/json"}
-
-    conn.execute("UPDATE recovery_keys SET is_used = 1, used_by = ? WHERE id = ?", (discord_id, key_id))
-    conn.commit()
-    conn.close()
-    
-    return json.dumps({"success": True, "message": "복구키 인증 성공! 대상 서버로 정상적으로 이동(입장)되었습니다."}), 200, {"Content-Type": "application/json"}
-
-@app.route("/callback")
-def callback():
-    code = request.args.get("code")
-    if not code:
-        return "인증 실패: 코드가 존재하지 않습니다."
-    if not CLIENT_SECRET or not REDIRECT_URI:
-        return "서버 설정 오류: DISCORD_CLIENT_SECRET / REDIRECT_URI 환경변수가 설정되지 않았습니다."
-
-    data = urllib.parse.urlencode({
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-        "grant_type": "authorization_code",
-        "code": code,
-        "redirect_uri": REDIRECT_URI,
-    }).encode("utf-8")
-
-    req = urllib.request.Request("https://discord.com/api/oauth2/token", data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
-    try:
-        with urllib.request.urlopen(req) as response:
-            tokens = json.loads(response.read().decode())
-    except Exception as e:
-        return f"토큰 발급 실패: {e}"
-
-    access_token = tokens.get("access_token")
-    if not access_token:
-        return "토큰 발급에 실패했습니다."
-
-    user_req = urllib.request.Request("https://discord.com/api/users/@me", headers={"Authorization": f"Bearer {access_token}"})
-    try:
-        with urllib.request.urlopen(user_req) as response:
-            user_data = json.loads(response.read().decode())
-    except Exception as e:
-        return f"사용자 정보 조회 실패: {e}"
-
-    username = user_data.get("username", "사용자")
-    user_id = user_data.get("id")
-
-    # 사용자의 OAuth 토큰을 DB에 저장해 추후 복구키 사용 시 활용 가능하도록 함
-    conn = get_conn()
-    conn.execute(
-        "INSERT INTO oauth_tokens (user_id, access_token, updated_at) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET access_token = ?, updated_at = ?",
-        (user_id, access_token, now_kst_str(), access_token, now_kst_str())
-    )
-    conn.commit()
-    conn.close()
-
-    guild_id = request.args.get("state")
-    join_status = "미처리"
-
-    if guild_id and TOKEN:
-        status, member_data = discord_api_request("GET", f"/guilds/{guild_id}/members/{user_id}", TOKEN)
-        existing_roles = member_data.get("roles", []) if status == 200 else []
-        new_roles = list(set(existing_roles + ([VERIFY_ROLE_ID] if VERIFY_ROLE_ID else [])))
-
-        join_body = {"access_token": access_token}
-        if new_roles:
-            join_body["roles"] = new_roles
-        status, _ = discord_api_request("PUT", f"/guilds/{guild_id}/members/{user_id}", TOKEN, body=join_body)
-
-        if new_roles:
-            discord_api_request("PATCH", f"/guilds/{guild_id}/members/{user_id}", TOKEN, body={"roles": new_roles})
-
-        join_status = "정상 처리됨" if status in (200, 201, 204) else f"오류 (코드 {status})"
-    elif not guild_id:
-        join_status = "서버 정보 없음"
-
-    success_html = """
-    <!DOCTYPE html>
-    <html lang="ko">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>인증 성공</title>
-        <script src="https://cdn.tailwindcss.com"></script>
-    </head>
-    <body class="bg-slate-100 min-h-screen flex items-center justify-center p-4">
-        <div class="max-w-md w-full bg-white rounded-3xl p-8 text-center shadow-xl border border-slate-100">
-            <div class="w-14 h-14 bg-emerald-50 text-emerald-500 rounded-full flex items-center justify-center mx-auto mb-4 text-xl font-black border border-emerald-100">V</div>
-            <h1 class="text-2xl font-bold text-slate-800 mb-2">인증 및 토큰 연동 성공</h1>
-            <p class="text-slate-500 text-sm mb-6">서버 인증 및 복구키 연동용 계정 등록이 완료되었습니다.</p>
-            <div class="bg-slate-50 rounded-2xl p-4 mb-6 border border-slate-100 text-left">
-                <div class="flex justify-between items-center py-2 border-b border-slate-200/60 text-sm">
-                    <span class="text-slate-400">디스코드 계정</span>
-                    <span class="font-semibold text-slate-700">{{ username }}</span>
-                </div>
-                <div class="flex justify-between items-center py-2 text-sm">
-                    <span class="text-slate-400">서버 입장 / 역할 부여</span>
-                    <span class="font-semibold text-emerald-600">{{ join_status }}</span>
-                </div>
-            </div>
-            <p class="text-slate-400 text-xs mb-6">이제 창을 닫고 복구키 시스템을 이용하실 수 있습니다.</p>
-        </div>
-    </body>
-    </html>
-    """
-    return render_template_string(success_html, username=username, join_status=join_status)
-
-def run_flask():
-    app.run(host="0.0.0.0", port=8080)
 
 # ---------------------------------------------------------------------------
 # 디스코드 커맨드 트리 및 권한 체크
@@ -296,9 +32,6 @@ class GatedCommandTree(app_commands.CommandTree):
             await interaction.response.send_message("이 봇은 서버 안에서만 사용할 수 있어요.", ephemeral=True)
             return False
 
-        if interaction.command and interaction.command.name in ["인증패널", "복구키생성"]:
-            return True
-
         if not is_guild_registered(interaction.guild_id):
             await interaction.response.send_message(
                 "⚠️ 이 서버는 아직 봇 사용 등록이 안 되어 있어요.\n서버 관리자가 `!서버등록` 명령어를 먼저 실행해주세요.",
@@ -306,9 +39,15 @@ class GatedCommandTree(app_commands.CommandTree):
             )
             return False
 
-        if not is_admin(interaction):
+        if not is_admin_or_seller(interaction):
+            if interaction.data and interaction.data.get("custom_id") in [
+                "vending_buy", "vending_products", "vending_charge", "vending_info",
+                "select_category", "select_buy_item", "confirm_buy_item"
+            ]:
+                return True
+            
             await interaction.response.send_message(
-                "❌ 이 봇은 등록된 관리자만 사용할 수 있어요.\n서버 관리자에게 `!관리자등록` 을 요청하세요.",
+                "❌ 이 기능은 관리자 또는 등록된 판매자만 사용할 수 있어요.",
                 ephemeral=True,
             )
             return False
@@ -340,6 +79,23 @@ def init_db():
         )
     """)
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS item_stocks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            item TEXT NOT NULL,
+            content TEXT NOT NULL,
+            is_used INTEGER DEFAULT 0
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_points (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            points INTEGER DEFAULT 0,
+            PRIMARY KEY (guild_id, user_id)
+        )
+    """)
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             guild_id INTEGER NOT NULL,
@@ -352,28 +108,6 @@ def init_db():
             memo TEXT,
             created_at TEXT NOT NULL,
             recorded_by TEXT NOT NULL
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS allowed_channels (
-            guild_id INTEGER NOT NULL,
-            channel_id INTEGER NOT NULL,
-            PRIMARY KEY (guild_id, channel_id)
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS ticket_config (
-            guild_id INTEGER PRIMARY KEY,
-            log_channel_id INTEGER NOT NULL
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS active_tickets (
-            channel_id INTEGER PRIMARY KEY,
-            guild_id INTEGER NOT NULL,
-            buyer_id INTEGER NOT NULL,
-            item TEXT NOT NULL,
-            quantity INTEGER NOT NULL
         )
     """)
     cur.execute("""
@@ -393,36 +127,19 @@ def init_db():
         )
     """)
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS admin_notifications (
+        CREATE TABLE IF NOT EXISTS bot_sellers (
             guild_id INTEGER NOT NULL,
             user_id INTEGER NOT NULL,
-            stock_alert INTEGER DEFAULT 1,
-            event_alert INTEGER DEFAULT 1,
+            added_by INTEGER NOT NULL,
+            added_at TEXT NOT NULL,
             PRIMARY KEY (guild_id, user_id)
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS recovery_keys (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            guild_id INTEGER NOT NULL,
-            recovery_key TEXT UNIQUE,
-            is_used INTEGER DEFAULT 0,
-            used_by TEXT,
-            created_at TEXT NOT NULL
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS oauth_tokens (
-            user_id TEXT PRIMARY KEY,
-            access_token TEXT NOT NULL,
-            updated_at TEXT NOT NULL
         )
     """)
     conn.commit()
     conn.close()
 
 # ---------------------------------------------------------------------------
-# 등록 및 권한 헬퍼
+# 권한 및 헬퍼 함수
 # ---------------------------------------------------------------------------
 def is_guild_registered(guild_id: int) -> bool:
     conn = get_conn()
@@ -445,27 +162,20 @@ def is_bot_admin(guild_id: int, user_id: int) -> bool:
     conn.close()
     return row is not None
 
-def add_bot_admin(guild_id: int, user_id: int, added_by: int):
+def is_bot_seller(guild_id: int, user_id: int) -> bool:
+    conn = get_conn()
+    row = conn.execute("SELECT 1 FROM bot_sellers WHERE guild_id = ? AND user_id = ?", (guild_id, user_id)).fetchone()
+    conn.close()
+    return row is not None
+
+def add_bot_seller(guild_id: int, user_id: int, added_by: int):
     conn = get_conn()
     conn.execute(
-        "INSERT OR IGNORE INTO bot_admins (guild_id, user_id, added_by, added_at) VALUES (?, ?, ?, ?)",
+        "INSERT OR IGNORE INTO bot_sellers (guild_id, user_id, added_by, added_at) VALUES (?, ?, ?, ?)",
         (guild_id, user_id, added_by, now_kst_str()),
     )
     conn.commit()
     conn.close()
-
-def remove_bot_admin(guild_id: int, user_id: int) -> bool:
-    conn = get_conn()
-    cur = conn.execute("DELETE FROM bot_admins WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
-    conn.commit()
-    conn.close()
-    return cur.rowcount > 0
-
-def list_bot_admins(guild_id: int):
-    conn = get_conn()
-    rows = conn.execute("SELECT user_id FROM bot_admins WHERE guild_id = ?", (guild_id,)).fetchall()
-    conn.close()
-    return [r["user_id"] for r in rows]
 
 def is_admin(ctx_or_interaction) -> bool:
     if isinstance(ctx_or_interaction, discord.Interaction):
@@ -485,33 +195,25 @@ def is_admin(ctx_or_interaction) -> bool:
         return True
     return False
 
-def admin_only():
+def is_admin_or_seller(ctx_or_interaction) -> bool:
+    if is_admin(ctx_or_interaction):
+        return True
+    if isinstance(ctx_or_interaction, discord.Interaction):
+        guild_id = ctx_or_interaction.guild_id
+        user_id = ctx_or_interaction.user.id
+    else:
+        guild_id = ctx_or_interaction.guild.id if ctx_or_interaction.guild else None
+        user_id = ctx_or_interaction.author.id
+    
+    if guild_id and is_bot_seller(guild_id, user_id):
+        return True
+    return False
+
+def admin_or_seller_only():
     async def predicate(interaction: discord.Interaction) -> bool:
-        if is_admin(interaction):
+        if is_admin_or_seller(interaction):
             return True
-        await interaction.response.send_message("❌ 이 명령어는 관리자만 사용할 수 있어요.", ephemeral=True)
-        return False
-    return app_commands.check(predicate)
-
-def check_channel():
-    async def predicate(interaction: discord.Interaction) -> bool:
-        if not interaction.guild_id:
-            return True
-        conn = get_conn()
-        rows = conn.execute("SELECT channel_id FROM allowed_channels WHERE guild_id = ?", (interaction.guild_id,)).fetchall()
-        conn.close()
-
-        if not rows:
-            return True
-
-        allowed_channel_ids = [r["channel_id"] for r in rows]
-        if interaction.channel_id in allowed_channel_ids:
-            return True
-
-        await interaction.response.send_message(
-            f"⚠️ 이 명령어는 지정된 봇 사용 채널에서만 사용할 수 있어요.\n👉 허용된 채널: <#{'#>, <#'.join(map(str, allowed_channel_ids))}>",
-            ephemeral=True
-        )
+        await interaction.response.send_message("❌ 이 명령어는 관리자 또는 등록된 판매자만 사용할 수 있어요.", ephemeral=True)
         return False
     return app_commands.check(predicate)
 
@@ -521,44 +223,12 @@ def fmt_won(n: int) -> str:
 def now_kst_str() -> str:
     return datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
 
-# ---------------------------------------------------------------------------
-# 재고 알림 발송 함수
-# ---------------------------------------------------------------------------
-async def send_stock_alert_to_admins(guild: discord.Guild, item_name: str, left_stock: int):
-    if left_stock > 3 and left_stock != 0:
-        return
-
+def get_user_points(guild_id: int, user_id: int) -> int:
     conn = get_conn()
-    rows = conn.execute(
-        "SELECT user_id FROM admin_notifications WHERE guild_id = ? AND stock_alert = 1", (guild.id,)
-    ).fetchall()
+    row = conn.execute("SELECT points FROM user_points WHERE guild_id = ? AND user_id = ?", (guild_id, user_id)).fetchone()
     conn.close()
+    return row["points"] if row else 0
 
-    alert_user_ids = [r["user_id"] for r in rows]
-
-    for member in guild.members:
-        if member.bot:
-            continue
-        if member.guild_permissions.administrator or any(r.name == ADMIN_ROLE_NAME for r in member.roles):
-            if member.id not in alert_user_ids:
-                alert_user_ids.append(member.id)
-
-    for uid in alert_user_ids:
-        member = guild.get_member(uid)
-        if member:
-            try:
-                embed = discord.Embed(
-                    title="⚠️ [재고 임박/품절] 경고 알림",
-                    description=f"상품 **{item_name}**의 재고가 위험합니다!\n현재 남은 재고: **{left_stock}개**",
-                    color=discord.Color.red()
-                )
-                await member.send(embed=embed)
-            except Exception:
-                pass
-
-# ---------------------------------------------------------------------------
-# 이벤트
-# ---------------------------------------------------------------------------
 @bot.event
 async def on_ready():
     init_db()
@@ -569,673 +239,336 @@ async def on_ready():
         print(f"명령어 동기화 실패: {e}")
     print(f"✅ 로그인 완료: {bot.user}")
 
-@bot.event
-async def on_command_error(ctx: commands.Context, error: commands.CommandError):
-    if isinstance(error, commands.CommandNotFound):
-        return
-    if isinstance(error, commands.MemberNotFound):
-        await ctx.reply("⚠️ 해당 유저를 찾을 수 없어요. @멘션으로 지정해주세요.")
-        return
-    if isinstance(error, commands.MissingRequiredArgument):
-        await ctx.reply("⚠️ 필요한 값이 빠졌어요. 사용법을 확인해주세요.")
-        return
-    print(f"접두사 명령어 오류: {error}")
-
 # ---------------------------------------------------------------------------
-# 무제한 복구키 생성 슬래시 명령어
-# ---------------------------------------------------------------------------
-@bot.tree.command(name="복구키생성", description="[관리자] 현재 서버(A서버)로 유저를 이동시키기 위한 복구키를 무제한으로 생성합니다.")
-@admin_only()
-async def create_recovery_key(interaction: discord.Interaction):
-    raw_key = secrets.token_hex(4).upper()
-    formatted_key = f"{raw_key[:4]}-{raw_key[4:]}"
-    
-    conn = get_conn()
-    try:
-        conn.execute(
-            "INSERT INTO recovery_keys (guild_id, recovery_key, is_used, created_at) VALUES (?, ?, 0, ?)",
-            (interaction.guild_id, formatted_key, now_kst_str())
-        )
-        conn.commit()
-    except Exception as e:
-        conn.close()
-        await interaction.response.send_message("⚠️ 복구키 생성 중 오류가 발생했습니다.", ephemeral=True)
-        return
-    
-    conn.close()
-    
-    embed = discord.Embed(
-        title="🔑 복구키 생성 완료",
-        description=f"생성된 복구키: **`{formatted_key}`**\n\n이 복구키를 웹사이트에 입력하면, 이 서버(**{interaction.guild.name}**)로 유저가 자동 입장 처리됩니다.",
-        color=discord.Color.green()
-    )
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-# ---------------------------------------------------------------------------
-# 웹 인증 UI 버튼 및 패널
-# ---------------------------------------------------------------------------
-class VerificationView(discord.ui.View):
-    def __init__(self, guild_id: int):
-        super().__init__(timeout=None)
-        oauth_url = (
-            "https://discord.com/api/oauth2/authorize"
-            f"?client_id={CLIENT_ID}"
-            f"&redirect_uri={urllib.parse.quote(REDIRECT_URI or '')}"
-            "&response_type=code"
-            "&scope=identify%20guilds.join"
-            f"&state={guild_id}"
-        )
-        self.add_item(discord.ui.Button(label="인증하기", style=discord.ButtonStyle.link, url=oauth_url))
-
-@bot.tree.command(name="인증패널", description="[관리자] 유저 인증(서버 자동 입장 + 역할 부여)용 패널을 전송합니다.")
-@admin_only()
-async def verification_panel(interaction: discord.Interaction):
-    if not CLIENT_SECRET or not REDIRECT_URI:
-        await interaction.response.send_message(
-            "⚠️ DISCORD_CLIENT_SECRET / REDIRECT_URI 환경변수가 설정되지 않았어서 인증 패널을 만들 수 없어요.",
-            ephemeral=True,
-        )
-        return
-    embed = discord.Embed(
-        title="서버 멤버 인증 및 연동",
-        description="아래 **인증하기** 버튼을 눌러 OAuth2 승인을 진행해주세요.\n승인하면 자동으로 서버 입장, 역할 부여 및 복구키 연동 계정 등록이 처리돼요.",
-        color=discord.Color.blurple(),
-    )
-    await interaction.channel.send(embed=embed, view=VerificationView(interaction.guild_id))
-    await interaction.response.send_message("✅ 인증 패널이 생성되었습니다.", ephemeral=True)
-
-# ---------------------------------------------------------------------------
-# 등록 명령어 (!서버등록, !관리자등록, !관리자해제, !관리자목록)
+# 서버 및 권한 관리 명령어
 # ---------------------------------------------------------------------------
 @bot.command(name="서버등록")
 async def register_server(ctx: commands.Context):
     if ctx.guild is None:
-        await ctx.reply("이 명령어는 서버 안에서만 사용할 수 있어요.")
         return
     if not ctx.author.guild_permissions.administrator:
-        await ctx.reply("❌ 이 명령어는 Discord 서버의 '관리자(Administrator)' 권한을 가진 사람만 사용할 수 있어요.")
+        await ctx.reply("❌ 관리자만 가능합니다.")
         return
     if is_guild_registered(ctx.guild.id):
         await ctx.reply("✅ 이미 등록된 서버예요.")
         return
-
     register_guild(ctx.guild.id, ctx.author.id)
-    add_bot_admin(ctx.guild.id, ctx.author.id, ctx.author.id)
-    await ctx.reply(
-        "✅ 서버 등록 완료! 이제 슬래시 명령어(`/가격표` 등)를 쓸 수 있어요.\n"
-        f"({ctx.author.mention} 님은 자동으로 봇 관리자로 등록됐어요.)\n"
-        "다른 사람도 봇을 쓰게 하려면 `!관리자등록 @유저` 로 추가해주세요."
-    )
+    await ctx.reply("✅ 서버 등록 완료!")
 
-@bot.command(name="관리자등록")
-async def register_admin(ctx: commands.Context, member: discord.Member = None):
-    if ctx.guild is None:
-        await ctx.reply("이 명령어는 서버 안에서만 사용할 수 있어요.")
-        return
-    if not is_guild_registered(ctx.guild.id):
-        await ctx.reply("⚠️ 먼저 `!서버등록` 을 실행해주세요.")
-        return
-    if not is_admin(ctx):
-        await ctx.reply("❌ 이 명령어는 등록된 관리자만 사용할 수 있어요.")
-        return
-    if member is None:
-        await ctx.reply("사용법: `!관리자등록 @유저`")
+@bot.tree.command(name="판매자등록", description="[관리자] 특정 유저에게 패널 및 상품 관리 권한을 부여합니다.")
+@app_commands.describe(유저="판매자로 등록할 유저 멘션 (@유저)")
+async def register_seller(interaction: discord.Interaction, 유저: discord.Member):
+    if not is_admin(interaction):
+        await interaction.response.send_message("❌ 이 명령어는 서버 관리자만 실행할 수 있습니다.", ephemeral=True)
         return
 
-    add_bot_admin(ctx.guild.id, member.id, ctx.author.id)
-    await ctx.reply(f"✅ {member.mention} 님을 봇 관리자로 등록했어요.")
+    add_bot_seller(interaction.guild_id, 유저.id, interaction.user.id)
+    await interaction.response.send_message(f"✅ {유저.mention}님을 **판매자**로 등록했습니다. 이제 자판기 패널 생성 및 상품/재고 관리가 가능합니다.", ephemeral=True)
 
-@bot.command(name="관리자해제")
-async def unregister_admin(ctx: commands.Context, member: discord.Member = None):
-    if ctx.guild is None:
-        await ctx.reply("이 명령어는 서버 안에서만 사용할 수 있어요.")
-        return
-    if not is_admin(ctx):
-        await ctx.reply("❌ 이 명령어는 등록된 관리자만 사용할 수 있어요.")
-        return
-    if member is None:
-        await ctx.reply("사용법: `!관리자해제 @유저`")
-        return
-
-    removed = remove_bot_admin(ctx.guild.id, member.id)
-    if removed:
-        await ctx.reply(f"🗑️ {member.mention} 님의 봇 관리자 권한을 해제했어요.")
-    else:
-        await ctx.reply(f"⚠️ {member.mention} 님은 등록된 봇 관리자가 아니에요.")
-
-@bot.command(name="관리자목록")
-async def list_admins(ctx: commands.Context):
-    if ctx.guild is None:
-        await ctx.reply("이 명령어는 서버 안에서만 사용할 수 있어요.")
-        return
-    if not is_admin(ctx):
-        await ctx.reply("❌ 이 명령어는 등록된 관리자만 사용할 수 있어요.")
-        return
-
-    ids = list_bot_admins(ctx.guild.id)
-    if not ids:
-        await ctx.reply("등록된 봇 관리자가 없어요.")
-        return
-    mentions = "\n".join(f"<@{uid}>" for uid in ids)
-    await ctx.reply(f"👑 등록된 봇 관리자:\n{mentions}")
-
-# ---------------------------------------------------------------------------
-# 채널 관리 명령어 (/방등록, /방해제)
-# ---------------------------------------------------------------------------
-@bot.tree.command(name="방등록", description="[관리자] 현재 채널을 봇 사용 가능 채널로 등록합니다.")
-@admin_only()
-async def register_channel(interaction: discord.Interaction):
+@bot.tree.command(name="가격추가", description="[관리자/판매자] 새 상품을 등록합니다.")
+@app_commands.describe(상품명="상품 이름", 가격="가격(원)", 카테고리="카테고리 이름", 재고="초기 재고")
+@admin_or_seller_only()
+async def add_price(interaction: discord.Interaction, 상품명: str, 가격: int, 카테고리: str = "기타", 재고: int = 0):
     conn = get_conn()
     try:
-        conn.execute("INSERT OR IGNORE INTO allowed_channels (guild_id, channel_id) VALUES (?, ?)", (interaction.guild_id, interaction.channel_id))
+        conn.execute("INSERT INTO prices (guild_id, item, category, price, stock) VALUES (?, ?, ?, ?, ?)", (interaction.guild_id, 상품명, 카테고리, 가격, 재고))
         conn.commit()
-        await interaction.response.send_message(f"✅ 성공적으로 이 채널(<#{interaction.channel_id}>)이 봇 사용 채널로 등록되었습니다.", ephemeral=True)
-    finally:
-        conn.close()
-
-@bot.tree.command(name="방해제", description="[관리자] 현재 채널을 봇 사용 가능 채널에서 제외합니다.")
-@admin_only()
-async def unregister_channel(interaction: discord.Interaction):
-    conn = get_conn()
-    cur = conn.execute("DELETE FROM allowed_channels WHERE guild_id = ? AND channel_id = ?", (interaction.guild_id, interaction.channel_id))
-    conn.commit()
-    conn.close()
-
-    if cur.rowcount > 0:
-        await interaction.response.send_message(f"🗑️ 이 채널(<#{interaction.channel_id}>)이 봇 사용 채널에서 제외되었습니다.", ephemeral=True)
-    else:
-        await interaction.response.send_message("⚠️ 이 채널은 등록된 봇 사용 채널이 아닙니다.", ephemeral=True)
-
-# ---------------------------------------------------------------------------
-# 알림 설정 시스템 (/알림설정 및 UI)
-# ---------------------------------------------------------------------------
-class NotificationSettingsView(discord.ui.View):
-    def __init__(self, guild_id: int, user_id: int):
-        super().__init__(timeout=180)
-        self.guild_id = guild_id
-        self.user_id = user_id
-        self.update_buttons()
-
-    def update_buttons(self):
-        conn = get_conn()
-        row = conn.execute("SELECT stock_alert, event_alert FROM admin_notifications WHERE guild_id = ? AND user_id = ?", (self.guild_id, self.user_id)).fetchone()
-        conn.close()
-
-        stock_status = row["stock_alert"] if row else 1
-        event_status = row["event_alert"] if row else 1
-
-        self.stock_btn.label = f"📦 게임 재고 알림: {'ON 🟢' if stock_status else 'OFF 🔴'}"
-        self.stock_btn.style = discord.ButtonStyle.success if stock_status else discord.ButtonStyle.secondary
-
-        self.event_btn.label = f"🎉 이벤트 알림: {'ON 🟢' if event_status else 'OFF 🔴'}"
-        self.event_btn.style = discord.ButtonStyle.success if event_status else discord.ButtonStyle.secondary
-
-    @discord.ui.button(custom_id="toggle_stock", style=discord.ButtonStyle.success)
-    async def stock_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        conn = get_conn()
-        row = conn.execute("SELECT stock_alert FROM admin_notifications WHERE guild_id = ? AND user_id = ?", (interaction.guild_id, interaction.user.id)).fetchone()
-        current = row["stock_alert"] if row else 1
-        new_val = 0 if current == 1 else 1
-
-        conn.execute(
-            "INSERT INTO admin_notifications (guild_id, user_id, stock_alert, event_alert) VALUES (?, ?, ?, 1) ON CONFLICT(guild_id, user_id) DO UPDATE SET stock_alert = ?",
-            (interaction.guild_id, interaction.user.id, new_val, new_val)
-        )
-        conn.commit()
-        conn.close()
-
-        self.update_buttons()
-        await interaction.response.edit_message(view=self)
-
-    @discord.ui.button(custom_id="toggle_event", style=discord.ButtonStyle.success)
-    async def event_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        conn = get_conn()
-        row = conn.execute("SELECT event_alert FROM admin_notifications WHERE guild_id = ? AND user_id = ?", (interaction.guild_id, interaction.user.id)).fetchone()
-        current = row["event_alert"] if row else 1
-        new_val = 0 if current == 1 else 1
-
-        conn.execute(
-            "INSERT INTO admin_notifications (guild_id, user_id, stock_alert, event_alert) VALUES (?, ?, 1, ?) ON CONFLICT(guild_id, user_id) DO UPDATE SET event_alert = ?",
-            (interaction.guild_id, interaction.user.id, new_val, new_val)
-        )
-        conn.commit()
-        conn.close()
-
-        self.update_buttons()
-        await interaction.response.edit_message(view=self)
-
-@bot.tree.command(name="알림설정", description="[관리자] 본인이 받을 봇 알림(재고, 이벤트 등)을 설정합니다.")
-@admin_only()
-@check_channel()
-async def notification_settings(interaction: discord.Interaction):
-    view = NotificationSettingsView(interaction.guild_id, interaction.user.id)
-    embed = discord.Embed(
-        title="🔔 관리자 알림 설정 센터",
-        description="아래 버튼을 눌러 받고 싶은 알림을 켜고(🟢) 끌 수(🔴) 있습니다.\n(설정은 관리자 개인별로 저장됩니다.)",
-        color=discord.Color.blue()
-    )
-    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-
-# ---------------------------------------------------------------------------
-# 가격표 명령어
-# ---------------------------------------------------------------------------
-@bot.tree.command(name="가격표", description="전체 상품 가격표를 보여줍니다.")
-@check_channel()
-async def price_list(interaction: discord.Interaction):
-    conn = get_conn()
-    rows = conn.execute("SELECT * FROM prices WHERE guild_id = ? ORDER BY category, item", (interaction.guild_id,)).fetchall()
-    conn.close()
-
-    if not rows:
-        await interaction.response.send_message("등록된 상품이 없어요.", ephemeral=True)
-        return
-
-    embed = discord.Embed(title="🛒 가격표", color=discord.Color.blurple(), timestamp=datetime.now(KST))
-    categories = {}
-    for r in rows:
-        categories.setdefault(r["category"], []).append(r)
-
-    for cat, items in categories.items():
-        lines = []
-        for it in items:
-            stock_txt = "무제한" if it["stock"] == -1 else f"{it['stock']}개"
-            min_txt = f" (최소주문: {it['min_quantity']}개)" if it['min_quantity'] > 1 else ""
-            lines.append(f"**{it['item']}** — {fmt_won(it['price'])} (재고: {stock_txt}){min_txt}")
-        embed.add_field(name=f"📂 {cat}", value="\n".join(lines), inline=False)
-
-    embed.set_footer(text="가격/재고는 변동될 수 있습니다.")
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="가격추가", description="[관리자] 새 상품을 등록합니다.")
-@app_commands.describe(상품명="상품 이름", 가격="가격(원)", 카테고리="분류(예: 롤, 배그)", 재고="재고 수량 (비우면 무제한)", 최소주문수량="최소 주문 가능 수량 (기본 1)")
-@admin_only()
-@check_channel()
-async def add_price(interaction: discord.Interaction, 상품명: str, 가격: int, 카테고리: str = "기타", 재고: int = -1, 최소주문수량: int = 1):
-    if 최소주문수량 < 1:
-        최소주문수량 = 1
-
-    conn = get_conn()
-    try:
-        conn.execute("INSERT INTO prices (guild_id, item, category, price, stock, min_quantity) VALUES (?, ?, ?, ?, ?, ?)", (interaction.guild_id, 상품명, 카테고리, 가격, 재고, 최소주문수량))
-        conn.commit()
-        await interaction.response.send_message(f"✅ **{상품명}** 상품을 등록했어요. ({fmt_won(가격)}, 분류: {카테고리}, 최소주문: {최소주문수량}개)")
+        await interaction.response.send_message(f"✅ **[{카테고리}]** ➡️ **{상품명}** 상품 등록 완료! ({fmt_won(가격)})", ephemeral=True)
     except sqlite3.IntegrityError:
-        await interaction.response.send_message(f"⚠️ **{상품명}** 상품은 이미 존재해요. `/가격수정`을 사용해주세요.", ephemeral=True)
+        await interaction.response.send_message(f"⚠️ **{상품명}** 상품은 이미 존재합니다.", ephemeral=True)
     finally:
         conn.close()
 
-@bot.tree.command(name="가격수정", description="[관리자] 기존 상품의 가격/재고/분류/최소주문을 수정합니다.")
-@app_commands.describe(상품명="수정할 상품 이름", 가격="새 가격(비우면 유지)", 재고="새 재고(비우면 유지)", 카테고리="새 분류(비우면 유지)", 최소주문수량="새 최소주문수량(비우면 유지)")
-@admin_only()
-@check_channel()
-async def edit_price(interaction: discord.Interaction, 상품명: str, 가격: int = None, 재고: int = None, 카테고리: str = None, 최소주문수량: int = None):
-    conn = get_conn()
-    row = conn.execute("SELECT * FROM prices WHERE guild_id = ? AND item = ?", (interaction.guild_id, 상품명)).fetchone()
-
-    if not row:
-        await interaction.response.send_message(f"⚠️ **{상품명}** 상품을 찾을 수 없어요.", ephemeral=True)
-        conn.close()
-        return
-
-    new_price = 가격 if 가격 is not None else row["price"]
-    new_stock = 재고 if 재고 is not None else row["stock"]
-    new_cat = 카테고리 if 카테고리 is not None else row["category"]
-    new_min = 최소주문수량 if 최소주문수량 is not None else row["min_quantity"]
-
-    conn.execute("UPDATE prices SET price = ?, stock = ?, category = ?, min_quantity = ? WHERE guild_id = ? AND item = ?", (new_price, new_stock, new_cat, new_min, interaction.guild_id, 상품명))
-    conn.commit()
-    conn.close()
-
-    await interaction.response.send_message(f"✅ **{상품명}** 수정 완료 → {fmt_won(new_price)}, 재고 {new_stock if new_stock != -1 else '무제한'}, 분류 {new_cat}, 최소주문 {new_min}개")
-
-@bot.tree.command(name="가격삭제", description="[관리자] 상품을 삭제합니다.")
-@app_commands.describe(상품명="삭제할 상품 이름")
-@admin_only()
-@check_channel()
-async def delete_price(interaction: discord.Interaction, 상품명: str):
-    conn = get_conn()
-    cur = conn.execute("DELETE FROM prices WHERE guild_id = ? AND item = ?", (interaction.guild_id, 상품명))
-    conn.commit()
-    conn.close()
-
-    if cur.rowcount == 0:
-        await interaction.response.send_message(f"⚠️ **{상품명}** 상품을 찾을 수 없어요.", ephemeral=True)
-    else:
-        await interaction.response.send_message(f"🗑️ **{상품명}** 상품을 삭제했어요.")
-
-# ---------------------------------------------------------------------------
-# 거래 내역 명령어
-# ---------------------------------------------------------------------------
-@bot.tree.command(name="거래추가", description="[관리자] 거래 내역을 기록합니다. (재고 자동 차감)")
-@app_commands.describe(구매자="구매한 유저", 상품명="상품 이름", 수량="구매 수량", 메모="비고(선택)")
-@admin_only()
-@check_channel()
-async def add_transaction(interaction: discord.Interaction, 구매자: discord.Member, 상품명: str, 수량: int = 1, 메모: str = ""):
-    if 수량 <= 0:
-        await interaction.response.send_message("⚠️ 수량은 1 이상이어야 해요.", ephemeral=True)
-        return
-
+@bot.tree.command(name="재고등록", description="[관리자/판매자] 자판기 상품에 실제 계정/코드를 추가합니다.")
+@app_commands.describe(상품명="등록된 상품 이름", 계정정보="지급될 텍스트 (예: id:a\npw:b)")
+@admin_or_seller_only()
+async def add_item_stock(interaction: discord.Interaction, 상품명: str, 계정정보: str):
     conn = get_conn()
     item_row = conn.execute("SELECT * FROM prices WHERE guild_id = ? AND item = ?", (interaction.guild_id, 상품명)).fetchone()
-
     if not item_row:
-        await interaction.response.send_message(f"⚠️ **{상품명}** 상품을 찾을 수 없어요.", ephemeral=True)
         conn.close()
+        await interaction.response.send_message(f"⚠️ **{상품명}** 상품이 먼저 `/가격추가`로 등록되어 있어야 합니다.", ephemeral=True)
         return
 
-    if 수량 < item_row["min_quantity"]:
-        await interaction.response.send_message(f"⚠️ 이 상품의 최소 주문 수량은 **{item_row['min_quantity']}개** 이상입니다.", ephemeral=True)
-        conn.close()
-        return
+    conn.execute("INSERT INTO item_stocks (guild_id, item, content, is_used) VALUES (?, ?, ?, 0)", (interaction.guild_id, 상품명, 계정정보))
+    stock_count = conn.execute("SELECT COUNT(*) as cnt FROM item_stocks WHERE guild_id = ? AND item = ? AND is_used = 0", (interaction.guild_id, 상품명)).fetchone()["cnt"]
+    conn.execute("UPDATE prices SET stock = ? WHERE guild_id = ? AND item = ?", (stock_count, interaction.guild_id, 상품명))
+    conn.commit()
+    conn.close()
 
-    if item_row["stock"] != -1 and item_row["stock"] < 수량:
-        await interaction.response.send_message(f"⚠️ 재고 부족해요. (현재 재고: {item_row['stock']})", ephemeral=True)
-        conn.close()
-        return
+    await interaction.response.send_message(f"✅ **{상품명}** 계정 재고 등록 완료 (총 가용 재고: {stock_count}개)", ephemeral=True)
 
-    unit_price = item_row["price"]
-    total_price = unit_price * 수량
-
+@bot.tree.command(name="수동충전", description="[관리자/판매자] 특정 유저의 포인트를 수동으로 충전해줍니다.")
+@app_commands.describe(유저="대상 유저 멘션 (@유저)", 금액="충전할 금액(원)")
+@admin_or_seller_only()
+async def manual_charge(interaction: discord.Interaction, 유저: discord.Member, 금액: int):
+    conn = get_conn()
     conn.execute(
-        "INSERT INTO transactions (guild_id, buyer_id, buyer_name, item, quantity, unit_price, total_price, memo, created_at, recorded_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (interaction.guild_id, 구매자.id, str(구매자), 상품명, 수량, unit_price, total_price, 메모, now_kst_str(), str(interaction.user)),
+        "INSERT INTO user_points (guild_id, user_id, points) VALUES (?, ?, ?) ON CONFLICT(guild_id, user_id) DO UPDATE SET points = points + ?",
+        (interaction.guild_id, 유저.id, 금액, 금액)
     )
-
-    left_stock = item_row["stock"]
-    if item_row["stock"] != -1:
-        left_stock -= 수량
-        conn.execute("UPDATE prices SET stock = ? WHERE guild_id = ? AND item = ?", (left_stock, interaction.guild_id, 상품명))
-
     conn.commit()
     conn.close()
+    current_total = get_user_points(interaction.guild_id, 유저.id)
+    await interaction.response.send_message(f"✅ {유저.mention}님에게 **{fmt_won(금액)}**을 수동 충전했습니다. (현재 잔액: {fmt_won(current_total)})", ephemeral=True)
 
-    if left_stock != -1:
-        await send_stock_alert_to_admins(interaction.guild, 상품명, left_stock)
+# ---------------------------------------------------------------------------
+# 추가 추천 기능 명령어 (포인트 조회, 구매 내역)
+# ---------------------------------------------------------------------------
+@bot.tree.command(name="포인트조회", description="내 남은 포인트 잔액을 확인합니다.")
+async def check_my_points(interaction: discord.Interaction):
+    pts = get_user_points(interaction.guild_id, interaction.user.id)
+    embed = discord.Embed(
+        title="💰 내 포인트 잔액",
+        description=f"{interaction.user.mention}님의 현재 잔액은 **{fmt_won(pts)}** 입니다.",
+        color=discord.Color.gold()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
-    embed = discord.Embed(title="🧾 거래 기록 완료", color=discord.Color.green())
-    embed.add_field(name="구매자", value=구매자.mention, inline=True)
-    embed.add_field(name="상품", value=상품명, inline=True)
-    embed.add_field(name="수량", value=str(수량), inline=True)
-    embed.add_field(name="합계", value=fmt_won(total_price), inline=True)
-    if 메모:
-        embed.add_field(name="메모", value=메모, inline=False)
-    embed.set_footer(text=f"기록자: {interaction.user} | {now_kst_str()}")
-
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="내거래내역", description="본인의 거래 내역을 조회합니다.")
-@check_channel()
-async def my_transactions(interaction: discord.Interaction):
+@bot.tree.command(name="내구매내역", description="최근 구매한 상품 내역을 확인합니다.")
+async def check_my_transactions(interaction: discord.Interaction):
     conn = get_conn()
-    rows = conn.execute("SELECT * FROM transactions WHERE guild_id = ? AND buyer_id = ? ORDER BY id DESC LIMIT 20", (interaction.guild_id, interaction.user.id)).fetchall()
+    rows = conn.execute(
+        "SELECT item, quantity, total_price, created_at FROM transactions WHERE guild_id = ? AND buyer_id = ? ORDER BY id DESC LIMIT 5",
+        (interaction.guild_id, interaction.user.id)
+    ).fetchall()
     conn.close()
 
     if not rows:
-        await interaction.response.send_message("거래 내역이 없어요.", ephemeral=True)
+        await interaction.response.send_message("📦 최근 구매 내역이 없습니다.", ephemeral=True)
         return
 
-    lines = []
-    total = 0
+    embed = discord.Embed(title="📜 최근 구매 내역 (최근 5건)", color=discord.Color.blurple())
     for r in rows:
-        lines.append(f"`{r['created_at']}` {r['item']} x{r['quantity']} = {fmt_won(r['total_price'])}")
-        total += r["total_price"]
-
-    embed = discord.Embed(title=f"📋 {interaction.user.display_name}님의 거래 내역 (최근 20건)", description="\n".join(lines), color=discord.Color.orange())
-    embed.set_footer(text=f"최근 20건 누적 합계: {fmt_won(total)}")
-
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="전체거래내역", description="[관리자] 전체 거래 내역을 조회합니다.")
-@app_commands.describe(구매자="특정 구매자만 필터링(선택)", 개수="조회할 최근 건수(기본 20)")
-@admin_only()
-@check_channel()
-async def all_transactions(interaction: discord.Interaction, 구매자: discord.Member = None, 개수: int = 20):
-    conn = get_conn()
-    if 구매자:
-        rows = conn.execute("SELECT * FROM transactions WHERE guild_id = ? AND buyer_id = ? ORDER BY id DESC LIMIT ?", (interaction.guild_id, 구매자.id, 개수)).fetchall()
-    else:
-        rows = conn.execute("SELECT * FROM transactions WHERE guild_id = ? ORDER BY id DESC LIMIT ?", (interaction.guild_id, 개수)).fetchall()
-    conn.close()
-
-    if not rows:
-        await interaction.response.send_message("거래 내역이 없어요.", ephemeral=True)
-        return
-
-    lines = []
-    total = 0
-    for r in rows:
-        lines.append(f"`{r['created_at']}` {r['buyer_name']} — {r['item']} x{r['quantity']} = {fmt_won(r['total_price'])}")
-        total += r["total_price"]
-
-    desc = "\n".join(lines)
-    if len(desc) > 4000:
-        desc = desc[:4000] + "\n...(생략)"
-
-    embed = discord.Embed(title="📋 전체 거래 내역", description=desc, color=discord.Color.dark_orange())
-    embed.set_footer(text=f"조회된 {len(rows)}건 합계: {fmt_won(total)}")
-
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="매출요약", description="[관리자] 전체 매출/판매량 요약을 보여줍니다.")
-@admin_only()
-@check_channel()
-async def sales_summary(interaction: discord.Interaction):
-    conn = get_conn()
-    total_row = conn.execute("SELECT COALESCE(SUM(total_price),0) as total, COUNT(*) as cnt FROM transactions WHERE guild_id = ?", (interaction.guild_id,)).fetchone()
-    top_items = conn.execute("SELECT item, SUM(quantity) as qty, SUM(total_price) as revenue FROM transactions WHERE guild_id = ? GROUP BY item ORDER BY revenue DESC LIMIT 5", (interaction.guild_id,)).fetchall()
-    conn.close()
-
-    embed = discord.Embed(title="📊 매출 요약", color=discord.Color.gold())
-    embed.add_field(name="총 매출", value=fmt_won(total_row["total"]), inline=True)
-    embed.add_field(name="총 거래 건수", value=f"{total_row['cnt']}건", inline=True)
-
-    if top_items:
-        lines = [f"{i+1}. **{r['item']}** — {r['qty']}개 판매 / {fmt_won(r['revenue'])}" for i, r in enumerate(top_items)]
-        embed.add_field(name="인기 상품 TOP 5", value="\n".join(lines), inline=False)
-
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-# ---------------------------------------------------------------------------
-# 티켓 시스템 (/서버지정, /티켓패널, /티켓닫기)
-# ---------------------------------------------------------------------------
-@bot.tree.command(name="서버지정", description="[관리자] 티켓 마감 시 구매 로그가 전송될 채널을 지정합니다.")
-@app_commands.describe(채널="로그를 받을 채널")
-@admin_only()
-async def set_server_log_channel(interaction: discord.Interaction, 채널: discord.TextChannel):
-    conn = get_conn()
-    conn.execute("INSERT INTO ticket_config (guild_id, log_channel_id) VALUES (?, ?) ON CONFLICT(guild_id) DO UPDATE SET log_channel_id = ?", (interaction.guild_id, 채널.id, 채널.id))
-    conn.commit()
-    conn.close()
-    await interaction.response.send_message(f"✅ 구매 로그 채널이 {채널.mention} (으)로 지정되었습니다.", ephemeral=True)
-
-class TicketSelect(discord.ui.Select):
-    def __init__(self, options_list):
-        super().__init__(placeholder="🛒 구매하실 상품을 선택해주세요!", min_values=1, max_values=1, options=options_list)
-
-    async def callback(self, interaction: discord.Interaction):
-        selected_item = self.values[0]
-        guild = interaction.guild
-
-        conn = get_conn()
-        item_row = conn.execute("SELECT * FROM prices WHERE guild_id = ? AND item = ?", (guild.id, selected_item)).fetchone()
-        conn.close()
-
-        if not item_row:
-            await interaction.response.send_message("⚠️ 해당 상품을 찾을 수 없습니다.", ephemeral=True)
-            return
-
-        min_qty = item_row["min_quantity"]
-
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(read_messages=False),
-            interaction.user: discord.PermissionOverwrite(read_messages=True, send_messages=True),
-            guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True)
-        }
-
-        for role in guild.roles:
-            if role.permissions.administrator or role.name == ADMIN_ROLE_NAME:
-                overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
-
-        channel_name = f"ticket-{interaction.user.name}-{selected_item}"
-        channel_name = "".join(c for c in channel_name if c.isalnum() or c in "-_").lower()[:90]
-
-        ticket_channel = await guild.create_text_channel(name=channel_name, overwrites=overwrites)
-
-        conn = get_conn()
-        conn.execute("INSERT INTO active_tickets (channel_id, guild_id, buyer_id, item, quantity) VALUES (?, ?, ?, ?, ?)", (ticket_channel.id, guild.id, interaction.user.id, selected_item, min_qty))
-        conn.commit()
-        conn.close()
-
-        embed = discord.Embed(
-            title="🎫 구매 티켓 생성 완료",
-            description=f"{interaction.user.mention}님, 환영합니다!\n선택하신 상품: **{selected_item}** ({fmt_won(item_row['price'])})\n최소 주문 수량: **{min_qty}개**\n\n관리자가 내용을 확인 후 처리를 도와드립니다. 완료되면 `/티켓닫기` 명령어를 입력해 마감할 수 있습니다.",
-            color=discord.Color.green()
+        embed.add_field(
+            name=f"상품: {r['item']} ({r['quantity']}개)",
+            value=f"• 결제 금액: `{fmt_won(r['total_price'])}`\n• 구매 일시: `{r['created_at']}`",
+            inline=False
         )
-        view = TicketControlView()
-        await ticket_channel.send(content=f"{interaction.user.mention}", embed=embed, view=view)
-        await interaction.response.send_message(f"✅ 티켓 채널이 생성되었습니다: {ticket_channel.mention}", ephemeral=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
-class TicketPanelView(discord.ui.View):
-    def __init__(self, options_list):
-        super().__init__(timeout=None)
-        self.add_item(TicketSelect(options_list))
-
-class TicketControlView(discord.ui.View):
+# ---------------------------------------------------------------------------
+# 자판기 UI 및 가격 계산기 모달 시스템
+# ---------------------------------------------------------------------------
+class VendingMainView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="🔒 티켓 마감 및 구매 완료", style=discord.ButtonStyle.danger, custom_id="close_ticket_btn")
-    async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not is_admin(interaction):
-            await interaction.response.send_message("❌ 티켓 마감은 관리자만 가능합니다.", ephemeral=True)
+    @discord.ui.button(label="🛒 구매", style=discord.ButtonStyle.primary, custom_id="vending_buy")
+    async def buy_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        conn = get_conn()
+        rows = conn.execute("SELECT DISTINCT category FROM prices WHERE guild_id = ?", (interaction.guild_id,)).fetchall()
+        conn.close()
+
+        if not rows:
+            await interaction.response.send_message("⚠️ 등록된 카테고리가 없습니다.", ephemeral=True)
             return
-        await execute_close_ticket(interaction)
 
-async def execute_close_ticket(interaction: discord.Interaction):
-    guild = interaction.guild
-    channel = interaction.channel
+        options = [discord.SelectOption(label=r["category"], value=r["category"]) for r in rows]
+        view = discord.ui.View()
+        view.add_item(CategorySelect(options))
+        await interaction.response.send_message("📂 **카테고리를 선택하세요**", view=view, ephemeral=True)
 
-    conn = get_conn()
-    ticket_row = conn.execute("SELECT * FROM active_tickets WHERE channel_id = ?", (channel.id,)).fetchone()
-
-    if not ticket_row:
-        await interaction.response.send_message("⚠️ 이 채널은 활성화된 티켓 채널이 아니거나 정보를 찾을 수 없습니다.", ephemeral=True)
+    @discord.ui.button(label="🔍 제품", style=discord.ButtonStyle.secondary, custom_id="vending_products")
+    async def products_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        conn = get_conn()
+        rows = conn.execute("SELECT * FROM prices WHERE guild_id = ? ORDER BY category, item", (interaction.guild_id,)).fetchall()
         conn.close()
-        return
 
-    buyer_id = ticket_row["buyer_id"]
-    item_name = ticket_row["item"]
-    quantity = ticket_row["quantity"]
+        if not rows:
+            await interaction.response.send_message("등록된 상품이 없어요.", ephemeral=True)
+            return
 
-    item_row = conn.execute("SELECT * FROM prices WHERE guild_id = ? AND item = ?", (guild.id, item_name)).fetchone()
+        embed = discord.Embed(title="🛒 자판기 전체 상품 목록", color=discord.Color.blurple())
+        current_cat, desc = "", ""
+        for r in rows:
+            if current_cat != r["category"]:
+                if current_cat != "":
+                    embed.add_field(name=f"📁 {current_cat}", value=desc, inline=False)
+                    desc = ""
+                current_cat = r["category"]
+            stock_txt = "무제한" if r["stock"] == -1 else f"{r['stock']}개"
+            desc += f"• **{r['item']}** - 가격: `{fmt_won(r['price'])}` (재고: {stock_txt})\n"
+        if current_cat != "":
+            embed.add_field(name=f"📁 {current_cat}", value=desc, inline=False)
 
-    if not item_row:
-        await interaction.response.send_message("⚠️ 해당 상품 가격 정보를 찾을 수 없습니다.", ephemeral=True)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="🎁 충전", style=discord.ButtonStyle.success, custom_id="vending_charge")
+    async def charge_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        current_pts = get_user_points(interaction.guild_id, interaction.user.id)
+        embed = discord.Embed(
+            title="💳 포인트 충전 안내",
+            description=f"현재 보유 잔액: **{fmt_won(current_pts)}**\n\n- 관리자 또는 판매자에게 문의하여 계좌입금 후 수동충전을 요청해주세요.",
+            color=discord.Color.green()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="⚙️ 정보", style=discord.ButtonStyle.secondary, custom_id="vending_info")
+    async def info_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        current_pts = get_user_points(interaction.guild_id, interaction.user.id)
+        embed = discord.Embed(
+            title="🤖 자판기 이용 정보",
+            description=f"내 잔액: **{fmt_won(current_pts)}**\n- 제품 구매 시 DM(개인메시지)로 계정 정보가 즉시 발송됩니다.",
+            color=discord.Color.blurple()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+class CategorySelect(discord.ui.Select):
+    def __init__(self, options):
+        super().__init__(placeholder="카테고리를 선택하세요", options=options, custom_id="select_category")
+
+    async def callback(self, interaction: discord.Interaction):
+        selected_category = self.values[0]
+        conn = get_conn()
+        rows = conn.execute("SELECT * FROM prices WHERE guild_id = ? AND category = ? AND (stock > 0 OR stock = -1)", (interaction.guild_id, selected_category)).fetchall()
         conn.close()
-        return
 
-    unit_price = item_row["price"]
-    total_price = unit_price * quantity
-    purchase_time_str = now_kst_str()
+        if not rows:
+            await interaction.response.send_message(f"⚠️ **{selected_category}** 카테고리에 구매 가능한 상품이 없습니다.", ephemeral=True)
+            return
 
-    config_row = conn.execute("SELECT log_channel_id FROM ticket_config WHERE guild_id = ?", (guild.id,)).fetchone()
+        options = [discord.SelectOption(label=r['item'], description=f"단가: {fmt_won(r['price'])}", value=r['item']) for r in rows]
+        view = discord.ui.View()
+        view.add_item(VendingItemSelect(options))
+        await interaction.response.edit_message(content=f"📂 선택된 카테고리: **{selected_category}**\n👇 구매할 상품을 선택해주세요:", view=view)
 
-    buyer_member = guild.get_member(buyer_id)
-    buyer_name = str(buyer_member.name) if buyer_member else f"ID: {buyer_id}"
-    buyer_avatar = buyer_member.display_avatar.url if buyer_member and buyer_member.display_avatar else (guild.icon.url if guild.icon else None)
+class VendingItemSelect(discord.ui.Select):
+    def __init__(self, options):
+        super().__init__(placeholder="구매할 상품을 선택하세요", options=options, custom_id="select_buy_item")
 
-    conn.execute(
-        "INSERT INTO transactions (guild_id, buyer_id, buyer_name, item, quantity, unit_price, total_price, memo, created_at, recorded_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (guild.id, buyer_id, str(buyer_member) if buyer_member else buyer_name, item_name, quantity, unit_price, total_price, "티켓 구매 완료", purchase_time_str, str(interaction.user)),
+    async def callback(self, interaction: discord.Interaction):
+        item_name = self.values[0]
+        await interaction.response.send_modal(QuantityModal(item_name))
+
+class QuantityModal(discord.ui.Modal, title="🧮 수량 선택 및 예상가격 계산기"):
+    quantity_input = discord.ui.TextInput(
+        label="구매할 개수 (숫자만 입력)",
+        placeholder="예: 1 또는 3",
+        default="1",
+        min_length=1,
+        max_length=5
     )
 
-    left_stock = item_row["stock"]
-    if item_row["stock"] != -1:
-        left_stock -= quantity
-        conn.execute("UPDATE prices SET stock = ? WHERE guild_id = ? AND item = ?", (left_stock, guild.id, item_name))
+    def __init__(self, item_name: str):
+        super().__init__()
+        self.item_name = item_name
 
-    conn.execute("DELETE FROM active_tickets WHERE channel_id = ?", (channel.id,))
-    conn.commit()
-    conn.close()
+    async def on_submit(self, interaction: discord.Interaction):
+        raw_val = self.quantity_input.value.strip()
+        if not raw_val.isdigit() or int(raw_val) <= 0:
+            await interaction.response.send_message("❌ 올바른 숫자를 입력해주세요!", ephemeral=True)
+            return
 
-    if left_stock != -1:
-        await send_stock_alert_to_admins(guild, item_name, left_stock)
+        qty = int(raw_val)
+        conn = get_conn()
+        item_row = conn.execute("SELECT * FROM prices WHERE guild_id = ? AND item = ?", (interaction.guild_id, self.item_name)).fetchone()
+        conn.close()
 
-    if config_row:
-        log_channel = guild.get_channel(config_row["log_channel_id"])
-        if log_channel:
-            log_embed = discord.Embed(
-                title="구매 완료",
-                description=f"**구매자**\n{buyer_name}\n\n**게임명**\n{item_name}\n\n**가격**\n{fmt_won(total_price)}\n\n**구매시간**\n{purchase_time_str}\n\n구매해주셔서 감사합니다! 이용해주셔서 진심으로 기쁩니다. 🎉",
-                color=discord.Color.from_rgb(255, 204, 0),
-                timestamp=datetime.now(KST)
+        if not item_row:
+            await interaction.response.send_message("⚠️ 존재하지 않는 상품입니다.", ephemeral=True)
+            return
+
+        unit_price = item_row["price"]
+        total_price = unit_price * qty
+        stock = item_row["stock"]
+
+        if stock != -1 and stock < qty:
+            await interaction.response.send_message(f"❌ 재고가 부족합니다! (현재 남은 재고: {stock}개)", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title=f"🛒 구매 및 가격 계산 결과",
+            description=f"상품명: **{self.item_name}**\n"
+                        f"• 구매 수량: **{qty}개**\n"
+                        f"• 개당 단가: `{fmt_won(unit_price)}`\n"
+                        f"👉 **총 예상 가격: `{fmt_won(total_price)}`**\n\n"
+                        f"구매를 진행하시겠습니까? 잔액에서 차감 후 DM으로 계정이 발송됩니다.",
+            color=discord.Color.green()
+        )
+        view = VendingConfirmView(self.item_name, qty, total_price)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+class VendingConfirmView(discord.ui.View):
+    def __init__(self, item_name: str, quantity: int, total_price: int):
+        super().__init__(timeout=60)
+        self.item_name = item_name
+        self.quantity = quantity
+        self.total_price = total_price
+
+    @discord.ui.button(label="✅ 최종 구매 확정", style=discord.ButtonStyle.danger, custom_id="confirm_buy_item")
+    async def confirm_purchase(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild_id = interaction.guild_id
+        user_id = interaction.user.id
+
+        my_pts = get_user_points(guild_id, user_id)
+        if my_pts < self.total_price:
+            await interaction.response.send_message(f"❌ 잔액이 부족합니다! (내 잔액: {fmt_won(my_pts)}, 필요 금액: {fmt_won(self.total_price)})", ephemeral=True)
+            return
+
+        conn = get_conn()
+        stock_rows = conn.execute("SELECT * FROM item_stocks WHERE guild_id = ? AND item = ? AND is_used = 0 LIMIT ?", (guild_id, self.item_name, self.quantity)).fetchall()
+        item_info = conn.execute("SELECT * FROM prices WHERE guild_id = ? AND item = ?", (guild_id, self.item_name)).fetchone()
+
+        if len(stock_rows) < self.quantity and item_info["stock"] != -1 and item_info["stock"] < self.quantity:
+            conn.close()
+            await interaction.response.send_message("❌ 처리 도중 재고가 부족해졌습니다.", ephemeral=True)
+            return
+
+        conn.execute("UPDATE user_points SET points = points - ? WHERE guild_id = ? AND user_id = ?", (self.total_price, guild_id, user_id))
+
+        account_contents = []
+        for s_row in stock_rows:
+            account_contents.append(s_row["content"])
+            conn.execute("UPDATE item_stocks SET is_used = 1 WHERE id = ?", (s_row["id"],))
+
+        combined_accounts = "\n---\n".join(account_contents) if account_contents else "관리자에게 문의해주세요 (텍스트 재고 부족)"
+
+        # 실제 남은 재고 개수를 정확하게 다시 카운트하여 prices 테이블 동기화
+        real_stock_count = conn.execute("SELECT COUNT(*) as cnt FROM item_stocks WHERE guild_id = ? AND item = ? AND is_used = 0", (guild_id, self.item_name)).fetchone()["cnt"]
+        new_stock = -1 if item_info["stock"] == -1 else real_stock_count
+        conn.execute("UPDATE prices SET stock = ? WHERE guild_id = ? AND item = ?", (new_stock, guild_id, self.item_name))
+
+        conn.execute(
+            "INSERT INTO transactions (guild_id, buyer_id, buyer_name, item, quantity, unit_price, total_price, memo, created_at, recorded_by) VALUES (?, ?, ?, ?, ?, ?, ?, '자판기 수량구매', ?, 'System')",
+            (guild_id, user_id, str(interaction.user), self.item_name, self.quantity, int(self.total_price/self.quantity), self.total_price, now_kst_str())
+        )
+        conn.commit()
+        conn.close()
+
+        dm_success = True
+        try:
+            dm_embed = discord.Embed(
+                title="🎉 [구매 성공] 자판기 상품 지급",
+                description=f"구매하신 상품 **{self.item_name}** ({self.quantity}개)의 계정 정보입니다:\n\n```text\n{combined_accounts}\n```",
+                color=discord.Color.gold()
             )
-            if buyer_avatar:
-                log_embed.set_thumbnail(url=buyer_avatar)
-            log_embed.set_footer(text=f"처리 관리자: {interaction.user}")
-            await log_channel.send(embed=log_embed)
+            await interaction.user.send(embed=dm_embed)
+        except Exception:
+            dm_success = False
 
-    await interaction.response.send_message("🔒 티켓이 마감되었습니다. 5초 뒤 채널이 삭제됩니다.", ephemeral=False)
-    await asyncio.sleep(5)
-    try:
-        await channel.delete()
-    except Exception:
-        pass
+        msg = f"✅ 총 **{self.quantity}개** 구매가 완료되었습니다!"
+        if not dm_success:
+            msg += f"\n⚠️ **DM 차단** 상태여서 발송 실패! 관리자에게 문의하세요:\n`{combined_accounts}`"
+        else:
+            msg += "\n📬 개인 메시지(DM)로 계정 정보가 발송되었습니다."
 
-@bot.tree.command(name="티켓닫기", description="[관리자] 티켓 채널 안에서 마감하고 거래 완료 및 재고 차감/로그 전송을 수행합니다.")
-@admin_only()
-async def close_ticket_command(interaction: discord.Interaction):
-    await execute_close_ticket(interaction)
+        await interaction.response.send_message(msg, ephemeral=True)
 
-@bot.tree.command(name="티켓패널", description="[관리자] 상품 선택 기능이 포함된 티켓 생성 패널을 이 채널에 전송합니다.")
-@admin_only()
-@check_channel()
-async def create_ticket_panel(interaction: discord.Interaction):
-    conn = get_conn()
-    rows = conn.execute("SELECT item, price, min_quantity FROM prices WHERE guild_id = ? ORDER BY category, item", (interaction.guild_id,)).fetchall()
-    conn.close()
-
-    if not rows:
-        await interaction.response.send_message("⚠️ 등록된 상품이 없습니다. 먼저 상품을 등록해주세요.", ephemeral=True)
-        return
-
-    options = []
-    for r in rows:
-        options.append(discord.SelectOption(label=r['item'], description=f"가격: {fmt_won(r['price'])} (최소: {r['min_quantity']}개)"))
-
-    if len(options) > 25:
-        options = options[:25]
-
+@bot.tree.command(name="자판기패널", description="[관리자/판매자] 자판기 메인 패널을 전송합니다.")
+@admin_or_seller_only()
+async def vending_panel(interaction: discord.Interaction):
     embed = discord.Embed(
-        title="🛒 상품 구매 티켓 센터",
-        description="아래 메뉴에서 **구매하실 상품을 선택**하시면 전용 티켓 채널이 생성됩니다!",
+        title="LUMOS 자판기",
+        description="상품 구매 시 다이렉트 메시지(DM)가 허용되어 있어야 합니다.",
         color=discord.Color.blurple()
     )
-    embed.set_footer(text="게임숍 티켓 시스템")
-
-    view = TicketPanelView(options)
+    embed.set_thumbnail(url=interaction.guild.icon.url if interaction.guild.icon else None)
+    view = VendingMainView()
     await interaction.channel.send(embed=embed, view=view)
-    await interaction.response.send_message("✅ 티켓 패널이 생성되었습니다.", ephemeral=True)
+    await interaction.response.send_message("✅ 자판기 패널이 생성되었습니다.", ephemeral=True)
 
-# ---------------------------------------------------------------------------
-# 슬래시 명령어 에러 핸들링
-# ---------------------------------------------------------------------------
-@bot.tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.CheckFailure):
-        return
-    print(f"명령어 오류: {error}")
-    if not interaction.response.is_done():
-        await interaction.response.send_message("⚠️ 오류가 발생했어요. 잠시 후 다시 시도해주세요.", ephemeral=True)
-
-# ---------------------------------------------------------------------------
-# 실행부 (Flask 백그라운드 쓰레드 실행 + Discord Bot 구동)
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     if not TOKEN:
-        raise SystemExit("❌ DISCORD_TOKEN 환경변수가 설정되지 않았어요.")
-    
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-
+        raise SystemExit("❌ DISCORD_TOKEN이 설정되지 않았어요.")
     bot.run(TOKEN)
