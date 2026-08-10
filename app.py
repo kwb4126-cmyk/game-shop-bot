@@ -6,6 +6,7 @@ import asyncio
 import urllib.request
 import urllib.parse
 import json
+import secrets
 from datetime import datetime, timezone, timedelta
 
 import discord
@@ -28,12 +29,15 @@ CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "1535126290221367316")
 CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "tr_U-UB3Qa1RgTxCy8nk8sZbveJKAqZW")
 REDIRECT_URI = os.getenv("REDIRECT_URI", "https://너의도메인주소.dishost.kr/callback")
 
+# 웹 관리자로 인정할 디스코드 사용자 ID 목록 (필요에 따라 본인 ID 추가)
+WEB_ADMIN_DISCORD_IDS = ["123456789012345678"]
+
 intents = discord.Intents.default()
 intents.members = True          
 intents.message_content = True  
 
 # ---------------------------------------------------------------------------
-# Flask 웹서버 (OAuth2 인증 처리)
+# Flask 웹서버 (OAuth2 인증 및 복구키 API 처리)
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
 
@@ -44,6 +48,56 @@ def home():
             return f.read()
     except FileNotFoundError:
         return "index.html 파일이 업로드되지 않았습니다."
+
+@app.route("/api/generate-key", methods=["POST"])
+def api_generate_key():
+    admin_id = request.form.get("discord_id")
+    if admin_id not in WEB_ADMIN_DISCORD_IDS:
+        return json.dumps({"success": False, "detail": "관리자만 복구키를 생성할 수 있습니다."}), 403, {"Content-Type": "application/json"}
+    
+    raw_key = secrets.token_hex(4).upper()
+    formatted_key = f"{raw_key[:4]}-{raw_key[4:]}"
+    
+    conn = get_conn()
+    try:
+        conn.execute(
+            "INSERT INTO recovery_keys (guild_id, recovery_key, is_used, created_at) VALUES (?, ?, 0, ?)",
+            (0, formatted_key, now_kst_str())
+        )
+        conn.commit()
+    except Exception:
+        conn.close()
+        return json.dumps({"success": False, "detail": "키 생성 중 오류가 발생했습니다."}), 500, {"Content-Type": "application/json"}
+    
+    conn.close()
+    return json.dumps({"success": True, "recovery_key": formatted_key}), 200, {"Content-Type": "application/json"}
+
+@app.route("/api/use-key", methods=["POST"])
+def api_use_key():
+    recovery_key = request.form.get("recovery_key")
+    discord_id = request.form.get("discord_id")
+    
+    if not recovery_key or not discord_id:
+        return json.dumps({"success": False, "detail": "모든 항목을 입력해주세요."}), 400, {"Content-Type": "application/json"}
+
+    conn = get_conn()
+    row = conn.execute("SELECT id, is_used FROM recovery_keys WHERE recovery_key = ?", (recovery_key,)).fetchone()
+    
+    if not row:
+        conn.close()
+        return json.dumps({"success": False, "detail": "존재하지 않는 복구키입니다."}), 400, {"Content-Type": "application/json"}
+    
+    key_id, is_used = row["id"], row["is_used"]
+    
+    if is_used == 1:
+        conn.close()
+        return json.dumps({"success": False, "detail": "이미 사용된 복구키입니다."}), 400, {"Content-Type": "application/json"}
+    
+    conn.execute("UPDATE recovery_keys SET is_used = 1, used_by = ? WHERE id = ?", (discord_id, key_id))
+    conn.commit()
+    conn.close()
+    
+    return json.dumps({"success": True, "message": "복구키가 성공적으로 인증 및 등록되었습니다!"}), 200, {"Content-Type": "application/json"}
 
 @app.route("/callback")
 def callback():
@@ -122,7 +176,6 @@ class GatedCommandTree(app_commands.CommandTree):
             await interaction.response.send_message("이 봇은 서버 안에서만 사용할 수 있어요.", ephemeral=True)
             return False
 
-        # 인증 패널 및 기본 관리는 등록 검사 스킵
         if interaction.command and interaction.command.name in ["인증패널"]:
             return True
 
@@ -226,6 +279,16 @@ def init_db():
             stock_alert INTEGER DEFAULT 1,
             event_alert INTEGER DEFAULT 1,
             PRIMARY KEY (guild_id, user_id)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS recovery_keys (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            recovery_key TEXT UNIQUE,
+            is_used INTEGER DEFAULT 0,
+            used_by TEXT,
+            created_at TEXT NOT NULL
         )
     """)
     conn.commit()
