@@ -55,22 +55,22 @@ INDEX_HTML = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>디스코드 봇 통합 관리 & 인증 센터</title>
+    <title>디스코드 봇 통합 관리 & 복구키 인증 센터</title>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-100 min-h-screen flex items-center justify-center p-4">
     <div class="max-w-md w-full bg-white rounded-3xl p-8 shadow-xl border border-slate-100">
         <div class="w-14 h-14 bg-indigo-50 text-indigo-500 rounded-full flex items-center justify-center mx-auto mb-4 text-xl font-black border border-indigo-100">🤖</div>
-        <h1 class="text-2xl font-bold text-slate-800 text-center mb-2">서버 관리 센터</h1>
-        <p class="text-slate-500 text-sm text-center mb-6">복구키 생성 및 계정 인증 처리 시스템입니다.</p>
+        <h1 class="text-2xl font-bold text-slate-800 text-center mb-2">서버 통합 관리 센터</h1>
+        <p class="text-slate-500 text-sm text-center mb-6">무제한 복구키 생성 및 서버 이동/인증 처리 시스템입니다.</p>
         
         <div class="space-y-4">
             <div class="bg-slate-50 p-4 rounded-2xl border border-slate-100">
-                <h2 class="text-sm font-semibold text-slate-700 mb-2">🔑 복구키 사용</h2>
+                <h2 class="text-sm font-semibold text-slate-700 mb-2">🔑 복구키 제출 (서버 자동 이동)</h2>
                 <form id="useKeyForm" onsubmit="useKey(event)" class="space-y-3">
-                    <input type="text" id="discordId" placeholder="디스코드 숫자 ID" required class="w-full px-3 py-2 text-sm bg-white border border-slate-200 rounded-xl focus:outline-none focus:border-indigo-500">
+                    <input type="text" id="discordId" placeholder="디스코드 숫자 ID (예: 123456789...)" required class="w-full px-3 py-2 text-sm bg-white border border-slate-200 rounded-xl focus:outline-none focus:border-indigo-500">
                     <input type="text" id="recoveryKey" placeholder="복구키 (XXXX-XXXX)" required class="w-full px-3 py-2 text-sm bg-white border border-slate-200 rounded-xl focus:outline-none focus:border-indigo-500">
-                    <button type="submit" class="w-full py-2.5 bg-indigo-600 text-white font-medium text-sm rounded-xl hover:bg-indigo-700 transition">복구키 제출</button>
+                    <button type="submit" class="w-full py-2.5 bg-indigo-600 text-white font-medium text-sm rounded-xl hover:bg-indigo-700 transition">복구키 제출 및 서버 연동</button>
                 </form>
                 <div id="useResult" class="mt-2 text-xs text-center font-medium"></div>
             </div>
@@ -87,11 +87,16 @@ INDEX_HTML = """
             formData.append('discord_id', discord_id);
             formData.append('recovery_key', recovery_key);
 
-            const response = await fetch('/api/use-key', { method: 'POST', body: formData });
-            const data = await response.json();
-            
-            resDiv.textContent = data.message || data.detail;
-            resDiv.className = data.success ? "mt-2 text-xs text-center font-medium text-emerald-600" : "mt-2 text-xs text-center font-medium text-rose-600";
+            try {
+                const response = await fetch('/api/use-key', { method: 'POST', body: formData });
+                const data = await response.json();
+                
+                resDiv.textContent = data.message || data.detail;
+                resDiv.className = data.success ? "mt-2 text-xs text-center font-medium text-emerald-600" : "mt-2 text-xs text-center font-medium text-rose-600";
+            } catch (err) {
+                resDiv.textContent = "서버 통신 중 오류가 발생했습니다.";
+                resDiv.className = "mt-2 text-xs text-center font-medium text-rose-600";
+            }
         }
     </script>
 </body>
@@ -101,56 +106,6 @@ INDEX_HTML = """
 @app.route("/")
 def home():
     return render_template_string(INDEX_HTML)
-
-@app.route("/api/generate-key", methods=["POST"])
-def api_generate_key():
-    admin_id = request.form.get("discord_id")
-    if admin_id not in WEB_ADMIN_DISCORD_IDS:
-        return json.dumps({"success": False, "detail": "관리자만 복구키를 생성할 수 있습니다."}), 403, {"Content-Type": "application/json"}
-    
-    raw_key = secrets.token_hex(4).upper()
-    formatted_key = f"{raw_key[:4]}-{raw_key[4:]}"
-    
-    conn = get_conn()
-    try:
-        conn.execute(
-            "INSERT INTO recovery_keys (guild_id, recovery_key, is_used, created_at) VALUES (?, ?, 0, ?)",
-            (0, formatted_key, now_kst_str())
-        )
-        conn.commit()
-    except Exception:
-        conn.close()
-        return json.dumps({"success": False, "detail": "키 생성 중 오류가 발생했습니다."}), 500, {"Content-Type": "application/json"}
-    
-    conn.close()
-    return json.dumps({"success": True, "recovery_key": formatted_key}), 200, {"Content-Type": "application/json"}
-
-@app.route("/api/use-key", methods=["POST"])
-def api_use_key():
-    recovery_key = request.form.get("recovery_key")
-    discord_id = request.form.get("discord_id")
-    
-    if not recovery_key or not discord_id:
-        return json.dumps({"success": False, "detail": "모든 항목을 입력해주세요."}), 400, {"Content-Type": "application/json"}
-
-    conn = get_conn()
-    row = conn.execute("SELECT id, is_used FROM recovery_keys WHERE recovery_key = ?", (recovery_key,)).fetchone()
-    
-    if not row:
-        conn.close()
-        return json.dumps({"success": False, "detail": "존재하지 않는 복구키입니다."}), 400, {"Content-Type": "application/json"}
-    
-    key_id, is_used = row["id"], row["is_used"]
-    
-    if is_used == 1:
-        conn.close()
-        return json.dumps({"success": False, "detail": "이미 사용된 복구키입니다."}), 400, {"Content-Type": "application/json"}
-    
-    conn.execute("UPDATE recovery_keys SET is_used = 1, used_by = ? WHERE id = ?", (discord_id, key_id))
-    conn.commit()
-    conn.close()
-    
-    return json.dumps({"success": True, "message": "복구키가 성공적으로 인증 및 등록되었습니다!"}), 200, {"Content-Type": "application/json"}
 
 def discord_api_request(method: str, path: str, token: str, token_type: str = "Bot", body: dict = None):
     url = f"https://discord.com/api{path}"
@@ -169,6 +124,68 @@ def discord_api_request(method: str, path: str, token: str, token_type: str = "B
             return e.code, json.loads(raw) if raw else {}
         except Exception:
             return e.code, {}
+
+@app.route("/api/use-key", methods=["POST"])
+def api_use_key():
+    recovery_key = request.form.get("recovery_key")
+    discord_id = request.form.get("discord_id")
+    
+    if not recovery_key or not discord_id:
+        return json.dumps({"success": False, "detail": "모든 항목을 입력해주세요."}), 400, {"Content-Type": "application/json"}
+
+    conn = get_conn()
+    row = conn.execute("SELECT id, guild_id, is_used FROM recovery_keys WHERE recovery_key = ?", (recovery_key,)).fetchone()
+    
+    if not row:
+        conn.close()
+        return json.dumps({"success": False, "detail": "존재하지 않는 복구키입니다."}), 400, {"Content-Type": "application/json"}
+    
+    key_id, target_guild_id, is_used = row["id"], row["guild_id"], row["is_used"]
+    
+    if is_used == 1:
+        conn.close()
+        return json.dumps({"success": False, "detail": "이미 사용된 복구키입니다."}), 400, {"Content-Type": "application/json"}
+    
+    # 봇 토큰을 이용해 해당 사용자(discord_id)를 target_guild_id 서버에 강제 추가 (OAuth2 토큰 없이 봇 권한으로 추가 불가하므로, 
+    # 만약 유저의 OAuth 토큰이 없다면 시스템적으로는 API 제약이 있으나, 
+    # 본 프로젝트의 인증패널 OAuth 플로우나 별도 연동을 통해 처리하거나 bot구조 내 add member endpoint 이용)
+    # 참고: Discord API에서 봇이 사용자를 서버에 넣으려면 사용자의 guilds.join OAuth2 access_token이 필수적입니다.
+    # 만약 복구키 입력만으로 넣으려면 사용자가 사전에 인증패널을 거쳤거나 OAuth 토큰이 저장되어 있어야 합니다.
+    # 여기서는 복구키 테이블에 연동된 유저의 access_token이 함께 저장되어 있거나 인증 연동이 되어있을 때 처리하도록 구성합니다.
+    
+    token_row = conn.execute("SELECT access_token FROM oauth_tokens WHERE user_id = ?", (discord_id,)).fetchone()
+    
+    if not token_row or not token_row["access_token"]:
+        conn.close()
+        return json.dumps({
+            "success": False, 
+            "detail": "해당 디스코드 계정의 인증 정보(OAuth 토큰)가 없습니다. 먼저 디스코드 봇을 통해 인증을 진행해주세요."
+        }), 400, {"Content-Type": "application/json"}
+
+    user_access_token = token_row["access_token"]
+    
+    # B서버(target_guild_id)로 유저 추가 시도
+    status, member_data = discord_api_request("GET", f"/guilds/{target_guild_id}/members/{discord_id}", TOKEN)
+    existing_roles = member_data.get("roles", []) if status == 200 else []
+    new_roles = list(set(existing_roles + ([VERIFY_ROLE_ID] if VERIFY_ROLE_ID else [])))
+
+    join_body = {"access_token": user_access_token}
+    if new_roles:
+        join_body["roles"] = new_roles
+        
+    put_status, _ = discord_api_request("PUT", f"/guilds/{target_guild_id}/members/{discord_id}", TOKEN, body=join_body)
+    if new_roles:
+        discord_api_request("PATCH", f"/guilds/{target_guild_id}/members/{discord_id}", TOKEN, body={"roles": new_roles})
+
+    if put_status not in (200, 201, 204):
+        conn.close()
+        return json.dumps({"success": False, "detail": f"서버 입장 처리 중 오류가 발생했습니다. (오류코드: {put_status})유저가 해당 앱을 통해 인증한 적이 있는지 확인해주세요."}), 500, {"Content-Type": "application/json"}
+
+    conn.execute("UPDATE recovery_keys SET is_used = 1, used_by = ? WHERE id = ?", (discord_id, key_id))
+    conn.commit()
+    conn.close()
+    
+    return json.dumps({"success": True, "message": "복구키 인증 성공! 대상 서버로 정상적으로 이동(입장)되었습니다."}), 200, {"Content-Type": "application/json"}
 
 @app.route("/callback")
 def callback():
@@ -207,6 +224,15 @@ def callback():
     username = user_data.get("username", "사용자")
     user_id = user_data.get("id")
 
+    # 사용자의 OAuth 토큰을 DB에 저장해 추후 복구키 사용 시 활용 가능하도록 함
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO oauth_tokens (user_id, access_token, updated_at) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET access_token = ?, updated_at = ?",
+        (user_id, access_token, now_kst_str(), access_token, now_kst_str())
+    )
+    conn.commit()
+    conn.close()
+
     guild_id = request.args.get("state")
     join_status = "미처리"
 
@@ -225,7 +251,7 @@ def callback():
 
         join_status = "정상 처리됨" if status in (200, 201, 204) else f"오류 (코드 {status})"
     elif not guild_id:
-        join_status = "서버 정보 없음 (인증 패널을 통해 다시 시도해주세요)"
+        join_status = "서버 정보 없음"
 
     success_html = """
     <!DOCTYPE html>
@@ -239,8 +265,8 @@ def callback():
     <body class="bg-slate-100 min-h-screen flex items-center justify-center p-4">
         <div class="max-w-md w-full bg-white rounded-3xl p-8 text-center shadow-xl border border-slate-100">
             <div class="w-14 h-14 bg-emerald-50 text-emerald-500 rounded-full flex items-center justify-center mx-auto mb-4 text-xl font-black border border-emerald-100">V</div>
-            <h1 class="text-2xl font-bold text-slate-800 mb-2">인증 성공</h1>
-            <p class="text-slate-500 text-sm mb-6">서버 인증이 정상적으로 완료되었습니다.</p>
+            <h1 class="text-2xl font-bold text-slate-800 mb-2">인증 및 토큰 연동 성공</h1>
+            <p class="text-slate-500 text-sm mb-6">서버 인증 및 복구키 연동용 계정 등록이 완료되었습니다.</p>
             <div class="bg-slate-50 rounded-2xl p-4 mb-6 border border-slate-100 text-left">
                 <div class="flex justify-between items-center py-2 border-b border-slate-200/60 text-sm">
                     <span class="text-slate-400">디스코드 계정</span>
@@ -251,7 +277,7 @@ def callback():
                     <span class="font-semibold text-emerald-600">{{ join_status }}</span>
                 </div>
             </div>
-            <p class="text-slate-400 text-xs mb-6">이제 브라우저 창을 닫고 디스코드 앱으로 돌아가셔도 좋습니다.</p>
+            <p class="text-slate-400 text-xs mb-6">이제 창을 닫고 복구키 시스템을 이용하실 수 있습니다.</p>
         </div>
     </body>
     </html>
@@ -270,7 +296,7 @@ class GatedCommandTree(app_commands.CommandTree):
             await interaction.response.send_message("이 봇은 서버 안에서만 사용할 수 있어요.", ephemeral=True)
             return False
 
-        if interaction.command and interaction.command.name in ["인증패널"]:
+        if interaction.command and interaction.command.name in ["인증패널", "복구키생성"]:
             return True
 
         if not is_guild_registered(interaction.guild_id):
@@ -383,6 +409,13 @@ def init_db():
             is_used INTEGER DEFAULT 0,
             used_by TEXT,
             created_at TEXT NOT NULL
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS oauth_tokens (
+            user_id TEXT PRIMARY KEY,
+            access_token TEXT NOT NULL,
+            updated_at TEXT NOT NULL
         )
     """)
     conn.commit()
@@ -549,6 +582,36 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError):
     print(f"접두사 명령어 오류: {error}")
 
 # ---------------------------------------------------------------------------
+# 무제한 복구키 생성 슬래시 명령어
+# ---------------------------------------------------------------------------
+@bot.tree.command(name="복구키생성", description="[관리자] 현재 서버(A서버)로 유저를 이동시키기 위한 복구키를 무제한으로 생성합니다.")
+@admin_only()
+async def create_recovery_key(interaction: discord.Interaction):
+    raw_key = secrets.token_hex(4).upper()
+    formatted_key = f"{raw_key[:4]}-{raw_key[4:]}"
+    
+    conn = get_conn()
+    try:
+        conn.execute(
+            "INSERT INTO recovery_keys (guild_id, recovery_key, is_used, created_at) VALUES (?, ?, 0, ?)",
+            (interaction.guild_id, formatted_key, now_kst_str())
+        )
+        conn.commit()
+    except Exception as e:
+        conn.close()
+        await interaction.response.send_message("⚠️ 복구키 생성 중 오류가 발생했습니다.", ephemeral=True)
+        return
+    
+    conn.close()
+    
+    embed = discord.Embed(
+        title="🔑 복구키 생성 완료",
+        description=f"생성된 복구키: **`{formatted_key}`**\n\n이 복구키를 웹사이트에 입력하면, 이 서버(**{interaction.guild.name}**)로 유저가 자동 입장 처리됩니다.",
+        color=discord.Color.green()
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# ---------------------------------------------------------------------------
 # 웹 인증 UI 버튼 및 패널
 # ---------------------------------------------------------------------------
 class VerificationView(discord.ui.View):
@@ -569,13 +632,13 @@ class VerificationView(discord.ui.View):
 async def verification_panel(interaction: discord.Interaction):
     if not CLIENT_SECRET or not REDIRECT_URI:
         await interaction.response.send_message(
-            "⚠️ DISCORD_CLIENT_SECRET / REDIRECT_URI 환경변수가 설정되지 않았아서 인증 패널을 만들 수 없어요.",
+            "⚠️ DISCORD_CLIENT_SECRET / REDIRECT_URI 환경변수가 설정되지 않았어서 인증 패널을 만들 수 없어요.",
             ephemeral=True,
         )
         return
     embed = discord.Embed(
-        title="서버 멤버 인증",
-        description="아래 **인증하기** 버튼을 눌러 OAuth2 승인을 진행해주세요.\n승인하면 자동으로 서버 입장과 역할 부여가 처리돼요.",
+        title="서버 멤버 인증 및 연동",
+        description="아래 **인증하기** 버튼을 눌러 OAuth2 승인을 진행해주세요.\n승인하면 자동으로 서버 입장, 역할 부여 및 복구키 연동 계정 등록이 처리돼요.",
         color=discord.Color.blurple(),
     )
     await interaction.channel.send(embed=embed, view=VerificationView(interaction.guild_id))
